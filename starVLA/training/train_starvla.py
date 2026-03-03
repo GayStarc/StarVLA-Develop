@@ -443,13 +443,33 @@ class VLATrainer(TrainerUtils):
         # prepare data iterators
         self._create_data_iterators()
 
+        # determine training mode
+        training_mode = getattr(self.config.trainer, "training_mode", "step")
+
         # create progress bar
-        progress_bar = tqdm(
-            range(self.config.trainer.max_train_steps), disable=not self.accelerator.is_local_main_process
-        )
+        if training_mode == "epoch":
+            total_epochs = self.config.trainer.epochs
+            progress_bar = tqdm(
+                range(total_epochs), desc="Epochs", disable=not self.accelerator.is_local_main_process
+            )
+            # advance progress bar to current epoch (for resume)
+            progress_bar.update(self.vla_epoch_count)
+        else:
+            progress_bar = tqdm(
+                range(self.config.trainer.max_train_steps), disable=not self.accelerator.is_local_main_process
+            )
+            # advance progress bar to current step (for resume)
+            progress_bar.update(self.completed_steps)
 
         # main training loop
-        while self.completed_steps < self.config.trainer.max_train_steps:
+        def _should_continue():
+            if training_mode == "epoch":
+                return self.vla_epoch_count < self.config.trainer.epochs
+            return self.completed_steps < self.config.trainer.max_train_steps
+
+        last_epoch_for_pbar = self.vla_epoch_count
+
+        while _should_continue():
             # get data batch
             t_start_data = time.perf_counter()
             batch_vla = self._get_next_batch()
@@ -462,16 +482,24 @@ class VLATrainer(TrainerUtils):
 
             # update progress
             if self.accelerator.sync_gradients:
-                progress_bar.update(1)
                 self.completed_steps += 1
-            
+                if training_mode == "epoch":
+                    # update progress bar when epoch changes
+                    if self.vla_epoch_count > last_epoch_for_pbar:
+                        progress_bar.update(self.vla_epoch_count - last_epoch_for_pbar)
+                        last_epoch_for_pbar = self.vla_epoch_count
+                else:
+                    progress_bar.update(1)
+
             if self.accelerator.is_local_main_process:
-                progress_bar.set_postfix(
-                        {
-                            "data_times": f"{t_end_data - t_start_data:.3f}",
-                            "model_times": f"{t_end_model - t_start_model:.3f}",
-                        }
-                    )
+                postfix = {
+                    "data_times": f"{t_end_data - t_start_data:.3f}",
+                    "model_times": f"{t_end_model - t_start_model:.3f}",
+                }
+                if training_mode == "epoch":
+                    postfix["epoch"] = self.vla_epoch_count
+                    postfix["step"] = self.completed_steps
+                progress_bar.set_postfix(postfix)
 
             # evaluate model
             if self.completed_steps % self.config.trainer.eval_interval == 0:
@@ -492,10 +520,6 @@ class VLATrainer(TrainerUtils):
                 self.accelerator.print(f"📌 Epoch {self.vla_epoch_count} completed, saving epoch checkpoint...")
                 self._save_checkpoint(epoch=self.vla_epoch_count)
                 self._last_saved_epoch = self.vla_epoch_count
-
-            # check termination condition
-            if self.completed_steps >= self.config.trainer.max_train_steps:
-                break
 
         # training end processing
         self._finalize_training()
@@ -537,7 +561,11 @@ class VLATrainer(TrainerUtils):
     def _log_training_config(self):
         """record training config"""
         if self.accelerator.is_main_process:
+            training_mode = getattr(self.config.trainer, "training_mode", "step")
             logger.info("***** Training Configuration *****")
+            logger.info(f"  Training mode = {training_mode}")
+            if training_mode == "epoch":
+                logger.info(f"  Epochs = {self.config.trainer.epochs}")
             logger.info(f"  Total optimization steps = {self.config.trainer.max_train_steps}")
             logger.info(f"  Per device batch size = {self.config.datasets.vla_data.per_device_batch_size}")
             logger.info(f"  Gradient accumulation steps = {self.config.trainer.gradient_accumulation_steps}")
@@ -646,6 +674,14 @@ def main(cfg) -> None:
     vla = build_framework(cfg)
     # prepare data
     vla_train_dataloader, val_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+
+    # Resolve max_train_steps for epoch mode
+    training_mode = getattr(cfg.trainer, "training_mode", "step")
+    if training_mode == "epoch":
+        steps_per_epoch = len(vla_train_dataloader)
+        cfg.trainer.max_train_steps = cfg.trainer.epochs * steps_per_epoch
+        if accelerator.is_main_process:
+            logger.info(f"Epoch mode: {cfg.trainer.epochs} epochs × {steps_per_epoch} steps/epoch = {cfg.trainer.max_train_steps} total steps")
 
     # set optimizer and scheduler
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
