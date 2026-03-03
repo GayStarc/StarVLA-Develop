@@ -14,6 +14,9 @@ DATASET_NAMED_MIXTURES = {
     "libero_one_shot": [
         ("libero_one_shot", 1.0, "libero_franka"),
     ],
+    "libero_spatial_one_shot": [
+        ("libero_spatial_one_shot_v3.0", 1.0, "libero_franka"),
+    ],
     "r1lite_mix": [
         ("Merge/0213_pick_banana_robot_in_hand_in_hand_out", 1.0, "r1lite"),
     ],

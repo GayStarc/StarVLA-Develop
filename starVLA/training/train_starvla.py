@@ -95,12 +95,12 @@ def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader]:
     """prepare training data"""
     # VLA data loader
     logger.info(f"Creating VLA Dataset with Mixture `{cfg.datasets.vla_data.data_mix}`")
-    vla_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
+    vla_train_dataloader, val_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
 
     accelerator.dataloader_config.dispatch_batches = False
     dist.barrier()
 
-    return vla_train_dataloader
+    return vla_train_dataloader, val_dataloader
 
 
 def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:
@@ -133,10 +133,11 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
 
 
 class VLATrainer(TrainerUtils):
-    def __init__(self, cfg, model, vla_train_dataloader, optimizer, lr_scheduler, accelerator):
+    def __init__(self, cfg, model, vla_train_dataloader, val_dataloader, optimizer, lr_scheduler, accelerator):
         self.config = cfg
         self.model = model
         self.vla_train_dataloader = vla_train_dataloader
+        self.val_dataloader = val_dataloader
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.accelerator = accelerator
@@ -146,6 +147,7 @@ class VLATrainer(TrainerUtils):
         self.vla_epoch_count = 0
         self._last_saved_epoch = -1  # 记录上次按epoch保存时的epoch数
         self.total_batch_size = self._calculate_total_batch_size()
+        self.action_norm_stats = None
     
     def prepare_training(self):
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -176,6 +178,22 @@ class VLATrainer(TrainerUtils):
             self.optimizer,
             self.vla_train_dataloader,
         )
+
+        # Load action norm stats for unnormalized validation metrics
+        stats_path = os.path.join(self.config.output_dir, "dataset_statistics.json")
+        if os.path.exists(stats_path):
+            with open(stats_path, "r") as f:
+                all_stats = json.load(f)
+            tag = next(iter(all_stats))
+            self.action_norm_stats = all_stats[tag]["action"]
+            logger.info(f"Loaded action norm stats from {stats_path} (tag={tag})")
+        else:
+            self.action_norm_stats = None
+            logger.warning(f"No dataset_statistics.json found at {stats_path}, unnorm eval disabled")
+
+        # Prepare val dataloader (not passed through accelerator/deepspeed)
+        if self.val_dataloader is not None:
+            logger.info(f"Val dataloader ready with {len(self.val_dataloader)} batches")
 
         self._init_wandb()
 
@@ -329,7 +347,8 @@ class VLATrainer(TrainerUtils):
     def _create_data_iterators(self):
         """create data iterators"""
         self.vla_iter = iter(self.vla_train_dataloader)
-        # self.vlm_iter = iter(self.vlm_train_dataloader)
+        if self.val_dataloader is not None:
+            self.val_iter = iter(self.val_dataloader)
 
     def _get_next_batch(self):
         """get next batch (automatically handle data loop)"""
@@ -342,6 +361,63 @@ class VLATrainer(TrainerUtils):
             batch_vla = next(self.vla_iter)
 
         return batch_vla
+
+    def _get_next_val_batch(self):
+        """get next validation batch (automatically handle data loop)"""
+        try:
+            batch = next(self.val_iter)
+        except StopIteration:
+            self.val_iter = iter(self.val_dataloader)
+            batch = next(self.val_iter)
+        return batch
+
+    def eval_unnorm_action(self, step_metrics):
+        """Evaluate unnormalized action prediction on validation set (action_chunk=1)."""
+        if self.val_dataloader is None or self.action_norm_stats is None:
+            return step_metrics
+
+        val_batch = self._get_next_val_batch()
+        gt_actions_norm = np.array([ex["action"] for ex in val_batch])  # [B, T, D]
+
+        output_dict = self.model.predict_action(
+            examples=val_batch, use_ddim=True, num_ddim_steps=20
+        )
+        pred_actions_norm = output_dict["normalized_actions"]  # [B, T, D]
+
+        if self.accelerator.is_main_process:
+            from starVLA.model.framework.base_framework import baseframework
+
+            # Extract action_chunk=1 only (first timestep)
+            gt_first = gt_actions_norm[:, 0:1, :]    # [B, 1, D]
+            pred_first = pred_actions_norm[:, 0:1, :] # [B, 1, D]
+
+            # Unnormalize
+            gt_unnorm = np.stack([
+                baseframework.unnormalize_actions(gt_first[i], self.action_norm_stats)
+                for i in range(len(gt_first))
+            ])  # [B, 1, D]
+            pred_unnorm = np.stack([
+                baseframework.unnormalize_actions(pred_first[i], self.action_norm_stats)
+                for i in range(len(pred_first))
+            ])  # [B, 1, D]
+
+            gt_unnorm = gt_unnorm[:, 0, :]    # [B, D]
+            pred_unnorm = pred_unnorm[:, 0, :] # [B, D]
+
+            # L1 (MAE) per dimension and mean
+            l1_per_dim = np.mean(np.abs(pred_unnorm - gt_unnorm), axis=0)
+            step_metrics["val/unnorm_l1_mean"] = float(np.mean(l1_per_dim))
+            for i, v in enumerate(l1_per_dim):
+                step_metrics[f"val/unnorm_l1_dim{i}"] = float(v)
+
+            # MSE per dimension and mean
+            mse_per_dim = np.mean((pred_unnorm - gt_unnorm) ** 2, axis=0)
+            step_metrics["val/unnorm_mse_mean"] = float(np.mean(mse_per_dim))
+            for i, v in enumerate(mse_per_dim):
+                step_metrics[f"val/unnorm_mse_dim{i}"] = float(v)
+
+        dist.barrier()
+        return step_metrics
 
     def _should_save_epoch(self):
         """检查是否需要按 epoch 保存 checkpoint
@@ -400,6 +476,7 @@ class VLATrainer(TrainerUtils):
             # evaluate model
             if self.completed_steps % self.config.trainer.eval_interval == 0:
                 step_metrics = self.eval_action_model(step_metrics)
+                step_metrics = self.eval_unnorm_action(step_metrics)
 
             # record metrics
             step_metrics["data_time"] = t_end_data - t_start_data
@@ -568,7 +645,7 @@ def main(cfg) -> None:
     # build model
     vla = build_framework(cfg)
     # prepare data
-    vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+    vla_train_dataloader, val_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
 
     # set optimizer and scheduler
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
@@ -579,6 +656,7 @@ def main(cfg) -> None:
         cfg=cfg,
         model=vla,
         vla_train_dataloader=vla_train_dataloader,
+        val_dataloader=val_dataloader,
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
         accelerator=accelerator,
