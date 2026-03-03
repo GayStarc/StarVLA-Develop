@@ -30,6 +30,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+*.whl
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -213,6 +214,7 @@ starVLA/config/frameworks/*
 starVLA/model/modules/sam_model/*
 assets/SAMv2.txt
 playground/*
+!playground/__init__.py
 qwen_talk.md
 assets/R1Pro.py
 examples/SPVLA
@@ -221,5 +223,8 @@ examples/Robotwin/train_files/submit_robotwin_training.sh
 starVLA/dataloader/gr00t_lerobot/datasets_temp.py
 MUJOCO_LOG.TXT
 examples/MultiRobot/*
+
+# Claude Code
+.claude/
 
 AGENTS.md

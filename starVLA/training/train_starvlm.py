@@ -96,6 +96,8 @@ class VLAMTrainer(TrainerUtils):
         self.lr_scheduler = lr_scheduler
         self.accelerator = accelerator
         self.completed_steps = 0
+        self.vlm_epoch_count = 0
+        self._last_saved_epoch = -1  # 记录上次按epoch保存时的epoch数
         self.total_batch_size = self._calculate_total_batch_size()
 
     def prepare_training(self):
@@ -150,11 +152,18 @@ class VLAMTrainer(TrainerUtils):
         self.accelerator.load_state(checkpoint_path)
         self.accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
 
-    def _save_checkpoint(self):
-        """Save current training state."""
+    def _save_checkpoint(self, epoch=None):
+        """Save current training state.
+
+        Args:
+            epoch: 如果指定，则以 epoch 格式命名 checkpoint，否则以 steps 格式命名
+        """
         if self.accelerator.is_main_process:
             save_format = getattr(self.config.trainer, "save_format", "pt")
-            checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
+            if epoch is not None:
+                checkpoint_path = os.path.join(self.checkpoint_dir, f"epoch_{epoch}_steps_{self.completed_steps}")
+            else:
+                checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
             state_dict = self.accelerator.get_state_dict(self.model)
             if save_format == "safetensors":
                 from safetensors.torch import save_file
@@ -164,7 +173,7 @@ class VLAMTrainer(TrainerUtils):
                 torch.save(state_dict, checkpoint_path + "_pytorch_model.pt")
             else:
                 raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
-            summary_data = {"steps": self.completed_steps}
+            summary_data = {"steps": self.completed_steps, "epoch": epoch}
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
                 f.write(json.dumps(summary_data) + "\n")
             self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
@@ -208,10 +217,23 @@ class VLAMTrainer(TrainerUtils):
         try:
             return next(self.vlm_iter)
         except StopIteration:
-            if not hasattr(self, "vlm_epoch_count"):
-                self.vlm_epoch_count = 0
             self.vlm_iter, self.vlm_epoch_count = self._reset_dataloader(self.vlm_train_dataloader, self.vlm_epoch_count)
             return next(self.vlm_iter)
+
+    def _should_save_epoch(self):
+        """检查是否需要按 epoch 保存 checkpoint
+
+        Returns:
+            bool: 是否需要保存
+        """
+        save_epoch_interval = getattr(self.config.trainer, "save_epoch_interval", None)
+        if save_epoch_interval is None or save_epoch_interval <= 0:
+            return False
+        if (self.vlm_epoch_count > 0
+            and self.vlm_epoch_count != self._last_saved_epoch
+            and self.vlm_epoch_count % save_epoch_interval == 0):
+            return True
+        return False
 
     def train(self):
         """Execute training loop."""
@@ -232,9 +254,17 @@ class VLAMTrainer(TrainerUtils):
 
             self._log_metrics(step_metrics)
 
+            # save checkpoint (按 steps 保存)
             if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
                 self._save_checkpoint()
                 dist.barrier()  # Ensure all processes are synchronized
+
+            # save checkpoint (按 epoch 保存)
+            if self._should_save_epoch():
+                self.accelerator.print(f"📌 Epoch {self.vlm_epoch_count} completed, saving epoch checkpoint...")
+                self._save_checkpoint(epoch=self.vlm_epoch_count)
+                self._last_saved_epoch = self.vlm_epoch_count
+                dist.barrier()
 
             if self.completed_steps >= self.config.trainer.max_train_steps:
                 break

@@ -45,12 +45,15 @@ class Args:
     # Utils
     #################################################################################################################
     video_out_path: str = "experiments/libero/logs"  # Path to save videos
+    results_dir: str = ""  # Path to save results txt (step-level folder)
 
     seed: int = 7  # Random Seed (for reproducibility)
 
     pretrained_path: str = ""
 
     post_process_action: bool = True
+
+    use_state: bool = False  # Whether to use state (proprio) input
 
     job_name: str = "test"
 
@@ -89,11 +92,13 @@ def eval_libero(args: Args) -> None:
         host=args.host,
         port=args.port,
         image_size=args.resize_size,
+        use_state=args.use_state,
     )
 
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
+    task_results = []  # Track per-task results for txt output
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
         # Get task
         task = task_suite.get_task(task_id)
@@ -169,6 +174,9 @@ def eval_libero(args: Args) -> None:
                     "lang": observation["instruction"][0],
                 }
 
+                if args.use_state:
+                    example_dict["state"] = state
+
                 
                 start_time = time.time()
                 
@@ -233,17 +241,35 @@ def eval_libero(args: Args) -> None:
             )
 
         # Log final results
+        task_sr = float(task_successes) / float(task_episodes)
+        task_results.append((task_description, task_sr, task_successes, task_episodes))
         logging.info(
-            f"Current task success rate: {float(task_successes) / float(task_episodes)}"
+            f"Current task success rate: {task_sr}"
         )
         logging.info(
             f"Current total success rate: {float(total_successes) / float(total_episodes)}"
         )
 
+    total_sr = float(total_successes) / float(total_episodes)
     logging.info(
-        f"Total success rate: {float(total_successes) / float(total_episodes)}"
+        f"Total success rate: {total_sr}"
     )
     logging.info(f"Total episodes: {total_episodes}")
+
+    # Write results txt file
+    if args.results_dir:
+        results_dir = pathlib.Path(args.results_dir)
+        results_dir.mkdir(parents=True, exist_ok=True)
+        txt_path = results_dir / f"{args.task_suite_name}_results.txt"
+        with open(txt_path, "w") as f:
+            f.write(f"Task Suite: {args.task_suite_name}\n")
+            f.write(f"{'='*60}\n")
+            for desc, sr, succ, eps in task_results:
+                f.write(f"  {desc}\n")
+                f.write(f"    Success Rate: {sr:.4f} ({succ}/{eps})\n")
+            f.write(f"{'='*60}\n")
+            f.write(f"Total Success Rate: {total_sr:.4f} ({total_successes}/{total_episodes})\n")
+        logging.info(f"Results saved to {txt_path}")
 
 
 def _get_libero_env(task, resolution, seed):

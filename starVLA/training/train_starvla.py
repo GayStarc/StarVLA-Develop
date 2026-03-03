@@ -143,6 +143,8 @@ class VLATrainer(TrainerUtils):
 
         # training status tracking
         self.completed_steps = 0
+        self.vla_epoch_count = 0
+        self._last_saved_epoch = -1  # 记录上次按epoch保存时的epoch数
         self.total_batch_size = self._calculate_total_batch_size()
     
     def prepare_training(self):
@@ -239,7 +241,13 @@ class VLATrainer(TrainerUtils):
         if pretrained_checkpoint:
             reload_modules = getattr(self.config.trainer, "reload_modules", None)
             self.model = self.load_pretrained_backbones(self.model, pretrained_checkpoint, reload_modules=reload_modules)
-            self.completed_steps = 0
+            try:
+                # 支持 steps_N_pytorch_model.pt 和 epoch_E_steps_N_pytorch_model.pt 两种格式
+                m = re.search(r"steps_(\d+)_pytorch_model\.pt", pretrained_checkpoint)
+                self.completed_steps = int(m.group(1)) if m else 0
+            except (AttributeError, ValueError):
+                logger.warning(f"Could not parse steps from pretrained checkpoint: {pretrained_checkpoint}")
+                self.completed_steps = 0
             self.resume_from_checkpoint = pretrained_checkpoint
             logger.info(f"Loaded pretrained checkpoint: {pretrained_checkpoint}, steps: {self.completed_steps}")
         else:
@@ -252,13 +260,20 @@ class VLATrainer(TrainerUtils):
         self.accelerator.load_state(checkpoint_path)
         self.accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
 
-    def _save_checkpoint(self):
-        """save current training state"""
+    def _save_checkpoint(self, epoch=None):
+        """save current training state
+
+        Args:
+            epoch: 如果指定，则以 epoch 格式命名 checkpoint，否则以 steps 格式命名
+        """
 
         if self.accelerator.is_main_process:
             save_format = getattr(self.config.trainer, "save_format", "pt")
 
-            checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
+            if epoch is not None:
+                checkpoint_path = os.path.join(self.checkpoint_dir, f"epoch_{epoch}_steps_{self.completed_steps}")
+            else:
+                checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
             # save model state
             state_dict = self.accelerator.get_state_dict(self.model)
             if save_format == "safetensors":
@@ -273,6 +288,7 @@ class VLATrainer(TrainerUtils):
             # save training metadata
             summary_data = {
                 "steps": self.completed_steps,
+                "epoch": epoch,
             }
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
                 f.write(json.dumps(summary_data) + "\n")
@@ -297,8 +313,10 @@ class VLATrainer(TrainerUtils):
         """record training metrics"""
         if self.completed_steps % self.config.trainer.logging_frequency == 0:
             if dist.get_rank() == 0:
-                # add learning rate 
-                metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0] # see lr group in yaml.trainer.learning_rate
+                # add learning rate for each param group
+                for i, (pg, lr) in enumerate(zip(self.optimizer.param_groups, self.lr_scheduler.get_last_lr())):
+                    name = pg.get("name", f"group_{i}")
+                    metrics[f"lr/{name}"] = lr
 
                 # add epoch info
                 metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
@@ -318,14 +336,28 @@ class VLATrainer(TrainerUtils):
         try:
             batch_vla = next(self.vla_iter)
         except StopIteration:
-            if not hasattr(self, "vla_epoch_count"):
-                self.vla_epoch_count = 0
             self.vla_iter, self.vla_epoch_count = TrainerUtils._reset_dataloader(
                 self.vla_train_dataloader, self.vla_epoch_count
             )
             batch_vla = next(self.vla_iter)
 
         return batch_vla
+
+    def _should_save_epoch(self):
+        """检查是否需要按 epoch 保存 checkpoint
+
+        Returns:
+            bool: 是否需要保存
+        """
+        save_epoch_interval = getattr(self.config.trainer, "save_epoch_interval", None)
+        if save_epoch_interval is None or save_epoch_interval <= 0:
+            return False
+        # 当 epoch 发生变化且达到保存间隔时触发保存
+        if (self.vla_epoch_count > 0
+            and self.vla_epoch_count != self._last_saved_epoch
+            and self.vla_epoch_count % save_epoch_interval == 0):
+            return True
+        return False
 
     def train(self):
         """execute training loop"""
@@ -374,9 +406,15 @@ class VLATrainer(TrainerUtils):
             step_metrics["model_time"] = t_end_model - t_start_model
             self._log_metrics(step_metrics)
 
-            # save checkpoint
+            # save checkpoint (按 steps 保存)
             if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
                 self._save_checkpoint()
+
+            # save checkpoint (按 epoch 保存)
+            if self._should_save_epoch():
+                self.accelerator.print(f"📌 Epoch {self.vla_epoch_count} completed, saving epoch checkpoint...")
+                self._save_checkpoint(epoch=self.vla_epoch_count)
+                self._last_saved_epoch = self.vla_epoch_count
 
             # check termination condition
             if self.completed_steps >= self.config.trainer.max_train_steps:
@@ -440,20 +478,57 @@ class VLATrainer(TrainerUtils):
                 action_loss = output_dict["action_loss"]
                 total_loss = action_loss
 
+            # Skip step if loss is NaN/Inf to avoid corrupting parameters
+            if not torch.isfinite(total_loss).item():
+                if self.accelerator.is_main_process:
+                    logger.warning(
+                        f"Step {self.completed_steps}: loss is NaN/Inf (action_loss={action_loss.item()}), skipping this step."
+                    )
+                # Still need to do a dummy backward + step to keep DeepSpeed state consistent
+                dummy_loss = sum(p.sum() * 0.0 for p in self.model.parameters() if p.requires_grad)
+                self.accelerator.backward(dummy_loss)
+                self.optimizer.step()
+                self.lr_scheduler.step()
+                self._nan_count = getattr(self, '_nan_count', 0) + 1
+                return {"action_dit_loss": float("nan"), "nan_count": self._nan_count, "skipped_step": True}
+
+            # Detect loss spike: if loss is abnormally large, scale it down to prevent
+            # gradient explosion. Track running average to detect spikes adaptively.
+            loss_val = total_loss.item()
+            if not hasattr(self, '_loss_ema'):
+                self._loss_ema = loss_val
+            else:
+                self._loss_ema = 0.99 * self._loss_ema + 0.01 * min(loss_val, self._loss_ema * 5)
+
+            spike_threshold = max(self._loss_ema * 5.0, 5.0)
+            if loss_val > spike_threshold:
+                scale_factor = spike_threshold / loss_val
+                total_loss = total_loss * scale_factor
+                if self.accelerator.is_main_process:
+                    logger.warning(
+                        f"Step {self.completed_steps}: loss spike detected ({loss_val:.4f} > {spike_threshold:.4f}), "
+                        f"scaling loss by {scale_factor:.4f}"
+                    )
+
             # VLA backward propagation
             self.accelerator.backward(total_loss)
 
-            # gradient clipping
+            # Log gradient norm before clipping for monitoring
             if self.config.trainer.gradient_clipping is not None:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
+                grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
+            else:
+                grad_norm = None
 
             # optimizer step
             self.optimizer.step()
             self.lr_scheduler.step()
 
-        return {
+        metrics = {
             "action_dit_loss": action_loss.item(),
         }
+        if grad_norm is not None:
+            metrics["grad_norm"] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+        return metrics
 
     def _finalize_training(self):
         """training end processing"""

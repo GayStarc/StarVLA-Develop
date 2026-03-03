@@ -66,7 +66,7 @@ class Qwen_PI(baseframework):
         self.qwen_vl_interface = get_vlm_model(config=self.config)
 
         # dynamic get llm config
-        num_vl_layers, llm_hidden_size = 36, self.qwen_vl_interface.model.config.hidden_size
+        num_vl_layers, llm_hidden_size = self.qwen_vl_interface.model.config.text_config.num_hidden_layers, 576 if self.qwen_vl_interface.model.config.model_type == "smolvlm" else self.qwen_vl_interface.model.config.hidden_size
         self.config.framework.qwenvl.vl_hidden_dim = llm_hidden_size
         self.config.framework.qwenvl.num_vl_layers = num_vl_layers
 

@@ -12,8 +12,14 @@ def get_vlm_model(config):
         from .QWen3_5 import _QWen3_5_VL_Interface
         return _QWen3_5_VL_Interface(config)
     elif "florence" in vlm_name.lower(): # temp for some ckpt
-        from .Florence2 import _Florence_Interface 
+        from .Florence2 import _Florence_Interface
         return _Florence_Interface(config)
+    elif "paligemma" in vlm_name.lower():
+        from .PaliGemma import _PaliGemma_Interface
+        return _PaliGemma_Interface(config)
+    elif "smolvlm" in vlm_name.lower():
+        from .SmolVLM import _SmolVLM_Interface
+        return _SmolVLM_Interface(config)
     elif "cosmos-reason2" in vlm_name.lower():
         from .CosmosReason2 import _CosmosReason2_Interface
         return _CosmosReason2_Interface(config)

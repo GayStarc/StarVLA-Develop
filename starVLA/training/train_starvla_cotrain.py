@@ -131,6 +131,9 @@ class VLAMTrainer(TrainerUtils):
 
         # training status tracking
         self.completed_steps = 0
+        self.vla_epoch_count = 0
+        self.vlm_epoch_count = 0
+        self._last_saved_epoch = -1  # 记录上次按epoch保存时的epoch数
         self.total_batch_size = self._calculate_total_batch_size()
 
     def prepare_training(self):
@@ -203,13 +206,20 @@ class VLAMTrainer(TrainerUtils):
         self.accelerator.load_state(checkpoint_path)
         self.accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
 
-    def _save_checkpoint(self):
-        """save current training state"""
+    def _save_checkpoint(self, epoch=None):
+        """save current training state
+
+        Args:
+            epoch: 如果指定，则以 epoch 格式命名 checkpoint，否则以 steps 格式命名
+        """
 
         if self.accelerator.is_main_process:
             save_format = getattr(self.config.trainer, "save_format", "pt")
 
-            checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
+            if epoch is not None:
+                checkpoint_path = os.path.join(self.checkpoint_dir, f"epoch_{epoch}_steps_{self.completed_steps}")
+            else:
+                checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
             # save model state
             state_dict = self.accelerator.get_state_dict(self.model)
             if save_format == "safetensors":
@@ -224,6 +234,7 @@ class VLAMTrainer(TrainerUtils):
             # save training metadata
             summary_data = {
                 "steps": self.completed_steps,
+                "epoch": epoch,
             }
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
                 f.write(json.dumps(summary_data) + "\n")
@@ -234,12 +245,12 @@ class VLAMTrainer(TrainerUtils):
                 logger.info("📊 Saving accessed configuration...")
                 output_dir = Path(self.config.output_dir)
                 # self.config.save_accessed_config(
-                #     output_dir / "config.json", 
+                #     output_dir / "config.json",
                 #     use_original_values=False
                 # )
                 self.config.save_accessed_config(
-                    output_dir / "config.yaml", 
-                    use_original_values=False 
+                    output_dir / "config.yaml",
+                    use_original_values=False
                 )
                 logger.info("✅ Configuration files saved")
 
@@ -252,8 +263,10 @@ class VLAMTrainer(TrainerUtils):
         ):  # some parameters should be initialized for the class
             if dist.get_rank() == 0:
 
-                # add learning rate
-                metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0]
+                # add learning rate for each param group
+                for i, (pg, lr) in enumerate(zip(self.optimizer.param_groups, self.lr_scheduler.get_last_lr())):
+                    name = pg.get("name", f"group_{i}")
+                    metrics[f"lr/{name}"] = lr
 
                 # add epoch information
                 metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
@@ -273,9 +286,6 @@ class VLAMTrainer(TrainerUtils):
         try:
             batch_vla = next(self.vla_iter)
         except StopIteration:
-            # check if there is self.vla_epoch_count
-            if not hasattr(self, "vla_epoch_count"):
-                self.vla_epoch_count = 0
             self.vla_iter, self.vla_epoch_count = TrainerUtils._reset_dataloader(
                 self.vla_train_dataloader, self.vla_epoch_count
             )
@@ -284,12 +294,25 @@ class VLAMTrainer(TrainerUtils):
         try:
             batch_vlm = next(self.vlm_iter)
         except StopIteration:
-            if not hasattr(self, "vlm_epoch_count"):
-                self.vlm_epoch_count = 0
             self.vlm_iter, self.vlm_epoch_count = self._reset_dataloader(self.vlm_train_dataloader, self.vlm_epoch_count)
             batch_vlm = next(self.vlm_iter)
 
         return batch_vla, batch_vlm
+
+    def _should_save_epoch(self):
+        """检查是否需要按 epoch 保存 checkpoint（基于 VLA dataloader 的 epoch）
+
+        Returns:
+            bool: 是否需要保存
+        """
+        save_epoch_interval = getattr(self.config.trainer, "save_epoch_interval", None)
+        if save_epoch_interval is None or save_epoch_interval <= 0:
+            return False
+        if (self.vla_epoch_count > 0
+            and self.vla_epoch_count != self._last_saved_epoch
+            and self.vla_epoch_count % save_epoch_interval == 0):
+            return True
+        return False
 
     def train(self):
         """execute training loop"""
@@ -336,11 +359,18 @@ class VLAMTrainer(TrainerUtils):
             step_metrics["model_time"] = t_end_model - t_start_model
             self._log_metrics(step_metrics)
 
-            # save checkpoint
+            # save checkpoint (按 steps 保存)
             if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
                 self._save_checkpoint()
 
                 dist.barrier()  # ensure all processes are synchronized, avoid timeout
+
+            # save checkpoint (按 epoch 保存)
+            if self._should_save_epoch():
+                self.accelerator.print(f"📌 Epoch {self.vla_epoch_count} completed, saving epoch checkpoint...")
+                self._save_checkpoint(epoch=self.vla_epoch_count)
+                self._last_saved_epoch = self.vla_epoch_count
+                dist.barrier()
 
             # check termination condition
             if self.completed_steps >= self.config.trainer.max_train_steps:

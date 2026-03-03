@@ -70,8 +70,21 @@ LE_ROBOT3_TASKS_FILENAME = "meta/tasks.parquet"
 LE_ROBOT3_EPISODE_FILENAME = "meta/episodes/*/*.parquet"
 
 
-def calculate_dataset_statistics(parquet_paths: list[Path]) -> dict:
-    """Calculate the dataset statistics of all columns for a list of parquet files."""
+def calculate_dataset_statistics(
+    parquet_paths: list[Path],
+    target_action_dim: int | None = None,
+    target_state_dim: int | None = None,
+) -> dict:
+    """Calculate the dataset statistics of all columns for a list of parquet files.
+
+    Args:
+        parquet_paths: List of paths to parquet files.
+        target_action_dim: Target dimension for action keys. If specified, actions will be padded.
+        target_state_dim: Target dimension for state keys. If specified, states will be padded.
+
+    Returns:
+        Dictionary containing statistics for each modality.
+    """
     # Dataset statistics
     all_low_dim_data_list = []
     # Collect all the data
@@ -100,7 +113,23 @@ def calculate_dataset_statistics(parquet_paths: list[Path]) -> dict:
             )
         except Exception as e:
             print(f"Warning: Failed to process modality {le_modality} due to error: {e}")
-            continue  
+            continue
+
+        # Apply padding if needed
+        if le_modality.startswith("action.") and target_action_dim is not None:
+            current_dim = np_data.shape[-1]
+            if current_dim < target_action_dim:
+                pad_width = target_action_dim - current_dim
+                padding = [(0, 0)] * (np_data.ndim - 1) + [(0, pad_width)]
+                np_data = np.pad(np_data, padding, mode='constant', constant_values=0)
+                print(f"Padded {le_modality} from {current_dim} to {target_action_dim} dimensions")
+        elif le_modality.startswith("state.") and target_state_dim is not None:
+            current_dim = np_data.shape[-1]
+            if current_dim < target_state_dim:
+                pad_width = target_state_dim - current_dim
+                padding = [(0, 0)] * (np_data.ndim - 1) + [(0, pad_width)]
+                np_data = np.pad(np_data, padding, mode='constant', constant_values=0)
+                print(f"Padded {le_modality} from {current_dim} to {target_state_dim} dimensions")
 
         dataset_statistics[le_modality] = {
             "mean": np.mean(np_data, axis=0).tolist(),

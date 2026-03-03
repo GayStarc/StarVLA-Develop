@@ -609,3 +609,91 @@ class StateActionSinCosTransform(ModalityTransform):
             cos_state = torch.cos(state)
             data[key] = torch.cat([sin_state, cos_state], dim=-1)
         return data
+
+
+class StateActionDimensionPadding(InvertibleModalityTransform):
+    """
+    Class for padding state or action dimensions to target dimensions.
+
+    This transform pads action and state tensors with zeros to reach specified target dimensions.
+    It's useful for unifying different embodiments with varying action/state dimensions.
+
+    Args:
+        apply_to (list[str]): The keys in the modality to load and transform.
+        target_action_dim (int | None): Target dimension for action keys. If None, no padding is applied.
+        target_state_dim (int | None): Target dimension for state keys. If None, no padding is applied.
+    """
+
+    # Configurable attributes
+    target_action_dim: int | None = Field(
+        default=None, description="Target dimension for action keys."
+    )
+    target_state_dim: int | None = Field(
+        default=None, description="Target dimension for state keys."
+    )
+
+    # Private attributes to track original dimensions
+    _original_dims: dict[str, int] = PrivateAttr(default_factory=dict)
+
+    def model_dump(self, *args, **kwargs):
+        if kwargs.get("mode", "python") == "json":
+            include = {"apply_to", "target_action_dim", "target_state_dim"}
+        else:
+            include = kwargs.pop("include", None)
+
+        return super().model_dump(*args, include=include, **kwargs)
+
+    def _get_target_dim(self, key: str) -> int | None:
+        """Get the target dimension for a given key based on its modality type."""
+        if key.startswith("action."):
+            return self.target_action_dim
+        elif key.startswith("state."):
+            return self.target_state_dim
+        return None
+
+    def apply(self, data: dict[str, Any]) -> dict[str, Any]:
+        for key in self.apply_to:
+            if key not in data:
+                continue
+
+            tensor = data[key]
+            assert isinstance(
+                tensor, torch.Tensor
+            ), f"Unexpected input type: {type(tensor)}. Expected type: {torch.Tensor}"
+
+            target_dim = self._get_target_dim(key)
+            if target_dim is None:
+                continue
+
+            current_dim = tensor.shape[-1]
+
+            # Store original dimension for invertibility
+            if key not in self._original_dims:
+                self._original_dims[key] = current_dim
+
+            # Only pad if current dimension is less than target dimension
+            if current_dim < target_dim:
+                pad_width = target_dim - current_dim
+                # Pad at the end of the last dimension with zeros
+                padding = (0, pad_width)  # (left, right) padding for last dimension
+                data[key] = torch.nn.functional.pad(tensor, padding, mode="constant", value=0)
+
+        return data
+
+    def unapply(self, data: dict[str, Any]) -> dict[str, Any]:
+        for key in self.apply_to:
+            if key not in data:
+                continue
+
+            tensor = data[key]
+            assert isinstance(
+                tensor, torch.Tensor
+            ), f"Unexpected input type: {type(tensor)}. Expected type: {torch.Tensor}"
+
+            # Remove padding using stored original dimensions
+            if key in self._original_dims:
+                original_dim = self._original_dims[key]
+                # Slice to keep only the original dimensions
+                data[key] = tensor[..., :original_dim]
+
+        return data

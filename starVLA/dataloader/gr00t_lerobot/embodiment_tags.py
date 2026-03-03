@@ -52,6 +52,16 @@ class EmbodimentTag(Enum):
     The Franka Emika Panda robot.
     """
 
+    DUAL_HAND = "dual_hand"
+    """
+    Dual hand pretrain embodiment.
+    """
+
+    WIDOWX_V2 = "widowx_v2"
+    """
+    WidowX V2 (Bridge V2) embodiment.
+    """
+
 # Embodiment tag string: to projector index in the Action Expert Module
 EMBODIMENT_TAG_MAPPING = {
     EmbodimentTag.NEW_EMBODIMENT.value: 31,
@@ -61,6 +71,8 @@ EMBODIMENT_TAG_MAPPING = {
     EmbodimentTag.AGIBOT_GENIE1.value: 26,
     EmbodimentTag.GR1.value: 24,
     EmbodimentTag.FRANKA.value: 25,
+    EmbodimentTag.DUAL_HAND.value: 27,
+    EmbodimentTag.WIDOWX_V2.value: 28,
 }
 
 # Robot type to embodiment tag mapping
@@ -72,4 +84,10 @@ ROBOT_TYPE_TO_EMBODIMENT_TAG = {
     "demo_sim_franka_delta_joints": EmbodimentTag.FRANKA,
     "custom_robot_config": EmbodimentTag.NEW_EMBODIMENT,
     "fourier_gr1_arms_waist": EmbodimentTag.GR1,
+    "widowx": EmbodimentTag.NEW_EMBODIMENT,
+    "widowx_v2": EmbodimentTag.WIDOWX_V2,
+    "widowx_v2_padded14": EmbodimentTag.WIDOWX_V2,
+    "hand_pretrain": EmbodimentTag.DUAL_HAND,
+    "hand_pretrain_euler": EmbodimentTag.DUAL_HAND,
+    "widowx_orig_padded14": EmbodimentTag.NEW_EMBODIMENT,
 }

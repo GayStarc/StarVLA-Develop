@@ -255,9 +255,19 @@ class TrainerUtils:
                     print(f"❌ cannot find module path: {path}")
         else:  # full load
             try:
-                model.load_state_dict(checkpoint, strict=False)
+                model_state = model.state_dict()
+                filtered_checkpoint = {}
+                skipped_keys = []
+                for k, v in checkpoint.items():
+                    if k in model_state and model_state[k].shape == v.shape:
+                        filtered_checkpoint[k] = v
+                    elif k in model_state:
+                        skipped_keys.append((k, v.shape, model_state[k].shape))
+                model.load_state_dict(filtered_checkpoint, strict=False)
                 if dist.get_rank() == 0:
-                    print("✅ loaded <full_model> model parameters")
+                    print(f"✅ loaded <full_model> model parameters ({len(filtered_checkpoint)}/{len(checkpoint)} keys)")
+                    for k, ckpt_shape, model_shape in skipped_keys:
+                        print(f"⚠️ skipped '{k}': checkpoint {ckpt_shape} vs model {model_shape}")
                 loaded_modules = ["<full_model>"]
             except Exception as e:
                 raise RuntimeError(f"❌ loading full model failed: {e}")
@@ -463,30 +473,41 @@ class TrainerUtils:
             return None
 
     def _get_latest_checkpoint(self, checkpoint_dir):
-        """Find the latest checkpoint in the directory based on step number."""
+        """Find the latest checkpoint in the directory based on step number.
+
+        支持两种 checkpoint 命名格式:
+        - steps_{N}_pytorch_model.pt / steps_{N}_model.safetensors (按 steps 保存)
+        - epoch_{E}_steps_{N}_pytorch_model.pt / epoch_{E}_steps_{N}_model.safetensors (按 epoch 保存)
+
+        始终以 steps 数作为排序依据，返回最新的 checkpoint。
+        """
         if not os.path.exists(checkpoint_dir):
             self.accelerator.print(f"No checkpoint directory found at {checkpoint_dir}")
             return None, 0
 
-        # 获取所有符合命名规则，支持 .pt 和 .safetensors
-        checkpoints = [
-            f for f in os.listdir(checkpoint_dir) 
-            if re.match(r"steps_(\d+)_(?:pytorch_model\.pt|model\.safetensors)$", f)
-            and os.path.isfile(os.path.join(checkpoint_dir, f))  # 确保是文件
-        ]
+        # 匹配两种命名格式的 checkpoint 文件（支持 .pt 和 .safetensors）
+        step_pattern = re.compile(r"^steps_(\d+)_(?:pytorch_model\.pt|model\.safetensors)$")
+        epoch_pattern = re.compile(r"^epoch_(\d+)_steps_(\d+)_(?:pytorch_model\.pt|model\.safetensors)$")
 
-        if not checkpoints:
+        checkpoints_with_steps = []
+        for f in os.listdir(checkpoint_dir):
+            if not os.path.isfile(os.path.join(checkpoint_dir, f)):
+                continue
+
+            # 尝试匹配 steps 格式
+            m = step_pattern.match(f)
+            if m:
+                checkpoints_with_steps.append((f, int(m.group(1))))
+                continue
+
+            # 尝试匹配 epoch 格式
+            m = epoch_pattern.match(f)
+            if m:
+                checkpoints_with_steps.append((f, int(m.group(2))))  # 使用 steps 数排序
+                continue
+
+        if not checkpoints_with_steps:
             self.accelerator.print(f"No checkpoints found in {checkpoint_dir}")
-            return None, 0
-
-        # 提取步数并排序
-        try:
-            checkpoints_with_steps = [
-                (ckpt, int(re.search(r"steps_(\d+)_(?:pytorch_model\.pt|model\.safetensors)$", ckpt).group(1)))
-                for ckpt in checkpoints
-            ]
-        except AttributeError as e:
-            self.accelerator.print(f"Error parsing checkpoint filenames: {e}")
             return None, 0
 
         # 按步数排序，获取最新的 checkpoint

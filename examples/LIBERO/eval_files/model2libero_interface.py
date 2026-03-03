@@ -29,6 +29,7 @@ class ModelClient:
         use_ddim: bool = True,
         num_ddim_steps: int = 10,
         adaptive_ensemble_alpha = 0.1,
+        use_state: bool = False,
         host="0.0.0.0",
         port=10095,
     ) -> None:
@@ -38,7 +39,8 @@ class ModelClient:
         self.policy_setup = policy_setup
         self.unnorm_key = unnorm_key
 
-        print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key} ***")
+        self.use_state = use_state
+        print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key}, use_state: {use_state} ***")
         self.use_ddim = use_ddim
         self.num_ddim_steps = num_ddim_steps
         self.image_size = image_size
@@ -61,6 +63,7 @@ class ModelClient:
 
         self.action_norm_stats = self.get_action_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path)
         self.action_chunk_size = self.get_action_chunk_size(policy_ckpt_path=policy_ckpt_path)
+        self.state_norm_stats = self.get_state_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path) if self.use_state else None
         
 
     def _add_image_to_history(self, image: np.ndarray) -> None:
@@ -102,6 +105,14 @@ class ModelClient:
                 
         images = [self._resize_image(image) for image in images]
         example["image"] = images
+
+        # Normalize state if use_state is enabled
+        if self.use_state:
+            state = example.get("state", None)
+            if state is not None:
+                state = self.normalize_state(state, self.state_norm_stats)
+                example["state"] = state[np.newaxis, :].astype(np.float16)
+
         vla_input = {
             "examples": [example],
             "do_sample": False,
@@ -163,6 +174,28 @@ class ModelClient:
         # import ipdb; ipdb.set_trace()
         return model_config['framework']['action_model']['future_action_window_size'] + 1
 
+    @staticmethod
+    def get_state_stats(unnorm_key: str, policy_ckpt_path) -> dict:
+        policy_ckpt_path = Path(policy_ckpt_path)
+        model_config, norm_stats = read_mode_config(policy_ckpt_path)
+        unnorm_key = ModelClient._check_unnorm_key(norm_stats, unnorm_key)
+        return norm_stats[unnorm_key]["state"]
+
+    @staticmethod
+    def normalize_state(state: np.ndarray, state_norm_stats: Dict[str, np.ndarray]) -> np.ndarray:
+        """Normalize state using q99 mode, with binary for non-masked dims (e.g. gripper)."""
+        mask = state_norm_stats.get("mask", None)
+        q01 = np.array(state_norm_stats["q01"])
+        q99 = np.array(state_norm_stats["q99"])
+        if mask is None:
+            mask = q01 != q99
+        else:
+            mask = np.array(mask, dtype=bool)
+        normalized = np.copy(state).astype(np.float32)
+        normalized[mask] = 2.0 * (state[mask] - q01[mask]) / (q99[mask] - q01[mask]) - 1.0
+        normalized[mask] = np.clip(normalized[mask], -1, 1)
+        normalized[~mask] = (state[~mask] > 0.5).astype(np.float32)
+        return normalized
 
     def _resize_image(self, image: np.ndarray) -> np.ndarray:
         image = cv.resize(image, tuple(self.image_size), interpolation=cv.INTER_AREA)

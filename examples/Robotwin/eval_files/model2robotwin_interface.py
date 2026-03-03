@@ -1,16 +1,12 @@
-import collections
 import logging
-import math
-import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, Optional, Sequence
 from collections import deque
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
-import numpy as np
 import cv2 as cv
 import json_numpy
-
+import numpy as np
+from scipy.spatial.transform import Rotation
 
 from deployment.model_server.tools.websocket_policy_client import WebsocketClientPolicy
 from starVLA.model.tools import read_mode_config
@@ -20,6 +16,63 @@ try:
 except ImportError:
     AdaptiveEnsembler = None
 
+np.set_printoptions(precision=4, suppress=True, linewidth=10000)
+
+
+def wxyz_to_xyzw(quat):
+    """Convert quaternion from wxyz to xyzw."""
+    return np.array([quat[1], quat[2], quat[3], quat[0]], dtype=np.float64)
+
+
+def xyzw_to_wxyz(quat):
+    """Convert quaternion from xyzw to wxyz."""
+    return np.array([quat[3], quat[0], quat[1], quat[2]], dtype=np.float64)
+
+
+# Joint layout for delta: only arm joints use delta, gripper uses absolute
+# Format: left_arm, left_gripper, right_arm, right_gripper
+LEFT_ARM_DOF = 6
+LEFT_GRIPPER_DOF = 1
+RIGHT_ARM_DOF = 6
+RIGHT_GRIPPER_DOF = 1
+
+
+def quaternion_to_euler(quat_wxyz):
+    """Convert quaternion (w, x, y, z) to euler angles (roll, pitch, yaw)."""
+    return Rotation.from_quat(wxyz_to_xyzw(quat_wxyz)).as_euler('xyz', degrees=False)
+
+
+def euler_to_quaternion(euler):
+    """Convert euler angles (roll, pitch, yaw) to quaternion (w, x, y, z)."""
+    return xyzw_to_wxyz(Rotation.from_euler('xyz', euler, degrees=False).as_quat())
+
+
+def _extract_joint_positions(observation: Dict[str, Any]) -> Optional[np.ndarray]:
+    """Extract joint positions from observation["joint_action"].
+
+    Expected layout: {"left_arm": ndarray, "left_gripper": scalar/ndarray,
+                      "right_arm": ndarray, "right_gripper": scalar/ndarray, ...}
+    Returns: [left_arm, left_gripper, right_arm, right_gripper] concatenated.
+    """
+    joint_action = observation.get("joint_action")
+    if not isinstance(joint_action, dict):
+        return None
+
+    left_arm = joint_action.get("left_arm")
+    right_arm = joint_action.get("right_arm")
+    if left_arm is None or right_arm is None:
+        return None
+
+    parts = [np.asarray(left_arm)]
+    left_gripper = joint_action.get("left_gripper")
+    if left_gripper is not None:
+        parts.append(np.asarray(left_gripper).reshape(-1))
+    parts.append(np.asarray(right_arm))
+    right_gripper = joint_action.get("right_gripper")
+    if right_gripper is not None:
+        parts.append(np.asarray(right_gripper).reshape(-1))
+    return np.concatenate(parts)
+
 
 class ModelClient:
     def __init__(
@@ -28,7 +81,7 @@ class ModelClient:
         unnorm_key: Optional[str] = None,
         policy_setup: str = "robotwin",
         horizon: int = 0,
-        action_ensemble=False,
+        action_ensemble: bool = False,
         action_ensemble_horizon: Optional[int] = 3,
         image_size: list[int] = [224, 224],
         use_ddim: bool = True,
@@ -36,14 +89,17 @@ class ModelClient:
         adaptive_ensemble_alpha=0.1,
         host="127.0.0.1",
         port=5694,
-        action_mode: str = "abs",
+        use_delta: bool = False,
+        use_euler: bool = False,
+        use_joint: bool = True,
+        use_state: bool = True,
     ) -> None:
 
         self.client = WebsocketClientPolicy(host, port)
         self.policy_setup = policy_setup
         self.unnorm_key = unnorm_key
 
-        print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key}, action_mode: {action_mode} ***")
+        print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key} ***")
         self.use_ddim = use_ddim
         self.num_ddim_steps = num_ddim_steps
         self.image_size = image_size
@@ -51,12 +107,10 @@ class ModelClient:
         self.action_ensemble = action_ensemble and (AdaptiveEnsembler is not None)
         self.adaptive_ensemble_alpha = adaptive_ensemble_alpha
         self.action_ensemble_horizon = action_ensemble_horizon
-
-        # Action mode: "abs", "delta", or "rel"
-        self.action_mode = action_mode
-        # State tracking for delta/rel modes
-        self.initial_state = None  # s_0 for rel mode
-        self.prev_action = None  # last absolute action for delta mode
+        self.use_delta = use_delta
+        self.use_euler = use_euler
+        self.use_joint = use_joint
+        self.use_state = use_state
 
         self.task_description = None
         self.image_history = deque(maxlen=self.horizon)
@@ -66,11 +120,13 @@ class ModelClient:
             self.action_ensembler = None
         self.num_image_history = 0
 
-        self.action_norm_stats = self.get_action_stats(
-            self.unnorm_key, policy_ckpt_path=policy_ckpt_path, action_mode=action_mode
-        )
+        self.action_norm_stats = self.get_action_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path)
         self.action_chunk_size = self.get_action_chunk_size(policy_ckpt_path=policy_ckpt_path)
-        self.state_norm_stats = self.get_state_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path)
+        self.state_norm_stats = (
+            self.get_state_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path)
+            if self.use_state
+            else None
+        )
         self.raw_actions = None
 
     def reset(self, task_description: str) -> None:
@@ -80,9 +136,6 @@ class ModelClient:
             self.action_ensembler.reset()
         self.num_image_history = 0
         self.raw_actions = None
-        # Reset state tracking for delta/rel modes
-        self.initial_state = None
-        self.prev_action = None
 
     def step(
         self,
@@ -90,16 +143,11 @@ class ModelClient:
         step: int = 0,
     ) -> np.ndarray:
         state = example.get("state", None)
-        # if state is not None:
-        #     state = self.normalize_state(state, self.state_norm_stats)
-        #     state = state[[0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 6, 13]]
-        #     example["state"] = state.reshape(1, -1)
-
-        # Store initial state for delta/rel modes
-        if self.action_mode in ["delta", "rel"] and self.initial_state is None:
-            if state is None:
-                raise ValueError(f"action_mode='{self.action_mode}' requires state to be provided in example")
-            self.initial_state = np.array(state).copy()
+        if self.use_state and state is not None:
+            state = self.normalize_state(state, self.state_norm_stats)
+            example["state"] = state.reshape(1, -1)
+        elif not self.use_state and "state" in example:
+            del example["state"]
 
         task_description = example.get("lang", None)
         images = example["image"]
@@ -107,16 +155,11 @@ class ModelClient:
         if example is not None:
             if task_description != self.task_description:
                 self.reset(task_description)
-                # Re-store initial state after reset if in delta/rel mode
-                if self.action_mode in ["delta", "rel"] and state is not None:
-                    self.initial_state = np.array(state).copy()
 
         images = [self._resize_image(image) for image in images]
         example["image"] = images
-        example_copy = example.copy()
-        example_copy.pop("state")
         vla_input = {
-            "examples": [example_copy],
+            "examples": [example],
             "do_sample": False,
             "use_ddim": self.use_ddim,
             "num_ddim_steps": self.num_ddim_steps,
@@ -133,30 +176,17 @@ class ModelClient:
                 raise KeyError(f"Key 'normalized_actions' not found in response data: {response['data'].keys()}")
 
             normalized_actions = normalized_actions[0]
-            # Unnormalize to get delta/rel values
-            raw_actions = self.unnormalize_actions(
+            print(f"Normalized Actions: {normalized_actions}")
+            self.raw_actions = self.unnormalize_actions(
                 normalized_actions=normalized_actions, action_norm_stats=self.action_norm_stats
             )
-
-            # Convert delta/rel to absolute actions
-            if self.action_mode == "delta":
-                self.raw_actions = self._delta_to_absolute(raw_actions, state)
-            elif self.action_mode == "rel":
-                self.raw_actions = self._rel_to_absolute(raw_actions)
-            else:
-                self.raw_actions = raw_actions
 
         action_idx = step % action_chunk_size
         if action_idx >= len(self.raw_actions):
             pass
 
         current_action = self.raw_actions[action_idx]
-
-        # Update prev_action for delta mode (for cross-chunk continuity)
-        if self.action_mode == "delta":
-            self.prev_action = current_action.copy()
-
-        current_action = current_action[[0, 1, 2, 3, 4, 5, 12, 6, 7, 8, 9, 10, 11, 13]]
+        # current_action = current_action[[0, 1, 2, 3, 4, 5, 12, 6, 7, 8, 9, 10, 11, 13]]
         return current_action
 
     @staticmethod
@@ -164,7 +194,8 @@ class ModelClient:
         """
         Normalize the state
         """
-        mask = [True, True, True, True, True, True, True, True, True, True, True, True, False, False]
+        # mask = [True, True, True, True, True, True, True, True, True, True, True, True, False, False]
+        mask = [True, True, True, True, True, True, False, True, True, True, True, True, True, False] # Joint
         mask = np.array(mask, dtype=bool)
         state_high, state_low = np.array(state_norm_stats["max"]), np.array(state_norm_stats["min"])
         normalized_state = np.where(
@@ -181,75 +212,22 @@ class ModelClient:
         action_high, action_low = np.array(action_norm_stats["max"]), np.array(action_norm_stats["min"])
         normalized_actions = np.clip(normalized_actions, -1, 1)
 
+        # Continuous dims (mask=True): min-max unnormalize
+        # Binary dims (mask=False, e.g. gripper): threshold at 0.1 to get 0/1, matching training transform
         actions = np.where(
             mask,
             0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
-            normalized_actions,
+            (normalized_actions > 0.5).astype(np.float64),
         )
 
         return actions
 
-    def _delta_to_absolute(self, delta_actions: np.ndarray, current_state: np.ndarray) -> np.ndarray:
-        """
-        Convert delta actions to absolute actions.
-
-        Training: delta[0] = a[0] - s[0], delta[t] = a[t] - a[t-1]
-        Deployment: a[0] = delta[0] + base, a[t] = delta[t] + a[t-1]
-
-        Where base is:
-        - First chunk: initial_state (s_0)
-        - Subsequent chunks: prev_action (last action from previous chunk)
-        """
-        abs_actions = np.zeros_like(delta_actions)
-        mask = self.action_norm_stats.get("mask", np.ones(delta_actions.shape[-1], dtype=bool))
-
-        # Determine base action
-        base = self.prev_action if self.prev_action is not None else self.initial_state
-
-        for i in range(len(delta_actions)):
-            abs_actions[i] = np.where(mask, delta_actions[i] + base, delta_actions[i])
-            base = abs_actions[i]
-
-        return abs_actions
-
-    def _rel_to_absolute(self, rel_actions: np.ndarray) -> np.ndarray:
-        """
-        Convert relative actions to absolute actions.
-
-        Training: rel[t] = a[t] - s[0]
-        Deployment: a[t] = rel[t] + s[0]
-        """
-        abs_actions = np.zeros_like(rel_actions)
-        mask = self.action_norm_stats.get("mask", np.ones(rel_actions.shape[-1], dtype=bool))
-
-        for i in range(len(rel_actions)):
-            abs_actions[i] = np.where(mask, rel_actions[i] + self.initial_state, rel_actions[i])
-
-        return abs_actions
-
     @staticmethod
-    def get_action_stats(unnorm_key: str, policy_ckpt_path, action_mode: str = "abs") -> dict:
+    def get_action_stats(unnorm_key: str, policy_ckpt_path) -> dict:
         policy_ckpt_path = Path(policy_ckpt_path)
         model_config, norm_stats = read_mode_config(policy_ckpt_path)
         unnorm_key = ModelClient._check_unnorm_key(norm_stats, unnorm_key)
-
-        stats = norm_stats[unnorm_key]
-
-        # Support two formats:
-        # New format: {"robotwin": {"abs": {...}, "delta": {...}, "rel": {...}}}
-        # Old format: {"robotwin": {"action": {...}, "state": {...}}}
-
-        if action_mode in stats:
-            # New format: directly use the corresponding mode stats
-            mode_stats = stats[action_mode]
-            return mode_stats.get("action", mode_stats)
-        elif "action" in stats:
-            # Old format: only supports abs mode
-            if action_mode != "abs":
-                print(f"[WARNING] Statistics file only has abs mode, but {action_mode} was requested. Using abs stats.")
-            return stats["action"]
-        else:
-            raise ValueError(f"Invalid statistics file format for key: {unnorm_key}")
+        return norm_stats[unnorm_key]["action"]
 
     @staticmethod
     def get_state_stats(unnorm_key: str, policy_ckpt_path) -> dict:
@@ -286,7 +264,10 @@ def get_model(usr_args):
     host = usr_args.get("host", "127.0.0.1")
     port = usr_args.get("port", 5694)
     unnorm_key = usr_args.get("unnorm_key", None)
-    action_mode = usr_args.get("action_mode", "abs")
+    use_delta = usr_args.get("use_delta", False)
+    use_euler = usr_args.get("use_euler", False)
+    use_joint = usr_args.get("use_joint", True)
+    use_state = usr_args.get("use_state", True)
 
     if policy_ckpt_path is None:
         raise ValueError("policy_ckpt_path must be provided in config")
@@ -296,7 +277,10 @@ def get_model(usr_args):
         host=host,
         port=port,
         unnorm_key=unnorm_key,
-        action_mode=action_mode,
+        use_delta=use_delta,
+        use_euler=use_euler,
+        use_joint=use_joint,
+        use_state=use_state,
     )
 
 
@@ -304,26 +288,146 @@ def reset_model(model):
     model.reset(task_description="")
 
 
+# ---------------------------------------------------------------------------
+# Eval helpers
+# ---------------------------------------------------------------------------
+
+def _apply_joint_delta(raw_action: np.ndarray, current_qpos: np.ndarray) -> np.ndarray:
+    """Apply delta to arm joints while keeping gripper values absolute.
+
+    Expected layout: [left_arm(6), left_gripper(1), right_arm(6), right_gripper(1)].
+    Falls back to full-vector delta if the action length doesn't match.
+    """
+    expected_len = LEFT_ARM_DOF + LEFT_GRIPPER_DOF + RIGHT_ARM_DOF + RIGHT_GRIPPER_DOF
+    if len(raw_action) < expected_len:
+        return current_qpos + raw_action
+
+    action = np.array(raw_action, dtype=np.float64)
+    l_arm = slice(0, LEFT_ARM_DOF)
+    r_arm_start = LEFT_ARM_DOF + LEFT_GRIPPER_DOF
+    r_arm = slice(r_arm_start, r_arm_start + RIGHT_ARM_DOF)
+
+    action[l_arm] = current_qpos[l_arm] + raw_action[l_arm]
+    action[r_arm] = current_qpos[r_arm] + raw_action[r_arm]
+    return action
+
+
+def _compute_arm_target(
+    raw_xyz: np.ndarray,
+    raw_rot: np.ndarray,
+    current_endpose: np.ndarray,
+    use_delta: bool,
+    use_euler: bool,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute target xyz and quaternion (wxyz) for a single arm."""
+    current_xyz = current_endpose[0:3]
+    current_quat_wxyz = current_endpose[3:7]
+
+    if use_delta:
+        target_xyz = current_xyz + raw_xyz
+        if use_euler:
+            current_euler = quaternion_to_euler(current_quat_wxyz)
+            target_quat = euler_to_quaternion(current_euler + raw_rot)
+        else:
+            target_quat = xyzw_to_wxyz(
+                (Rotation.from_quat(wxyz_to_xyzw(raw_rot))
+                 * Rotation.from_quat(wxyz_to_xyzw(current_quat_wxyz))).as_quat()
+            )
+    else:
+        target_xyz = raw_xyz
+        target_quat = euler_to_quaternion(raw_rot) if use_euler else raw_rot
+
+    return target_xyz, target_quat
+
+
+def _parse_dual_arm_action(raw_action: np.ndarray, rot_dim: int):
+    """Split raw action into per-arm (xyz, rot, gripper) tuples.
+
+    Returns ((left_xyz, left_rot, left_gripper),
+             (right_xyz, right_rot, right_gripper)).
+    """
+    left_xyz = raw_action[0:3]
+    left_rot = raw_action[3:3 + rot_dim]
+    left_gripper = raw_action[3 + rot_dim]
+
+    right_start = 3 + rot_dim + 1
+    right_xyz = raw_action[right_start:right_start + 3]
+    right_rot = raw_action[right_start + 3:right_start + 3 + rot_dim]
+    right_gripper = raw_action[right_start + 3 + rot_dim]
+
+    return (left_xyz, left_rot, left_gripper), (right_xyz, right_rot, right_gripper)
+
+
+def _build_state(model, observation) -> np.ndarray:
+    """Build the state vector depending on joint vs. pose control mode."""
+    if model.use_joint:
+        state = _extract_joint_positions(observation)
+        if state is None:
+            logging.warning("use_joint enabled but no joint positions found in observation; using empty state.")
+            state = np.array([])
+        return state
+
+    # Pose control: state = [left_endpose(7), left_gripper(1), right_endpose(7), right_gripper(1)]
+    endpose = observation["endpose"]
+    return np.concatenate([
+        endpose["left_endpose"], [endpose["left_gripper"]],
+        endpose["right_endpose"], [endpose["right_gripper"]],
+    ])
+
+
+def _execute_action(TASK_ENV, model, raw_action, observation):
+    """Dispatch raw_action to the environment as joint (qpos) or pose (ee) control."""
+    if model.use_joint:
+        if model.use_delta:
+            current_qpos = _extract_joint_positions(observation)
+            if current_qpos is None:
+                logging.warning("use_joint+use_delta but no joint positions found; using absolute joint action.")
+                action = raw_action
+            else:
+                action = _apply_joint_delta(raw_action, current_qpos)
+        else:
+            action = raw_action
+        TASK_ENV.take_action(action, action_type='qpos')
+        return
+
+    # Pose control
+    endpose = observation["endpose"]
+    rot_dim = 3 if model.use_euler else 4
+    (l_xyz, l_rot, l_grip), (r_xyz, r_rot, r_grip) = _parse_dual_arm_action(raw_action, rot_dim)
+
+    left_target_xyz, left_target_quat = _compute_arm_target(
+        l_xyz, l_rot, endpose["left_endpose"], model.use_delta, model.use_euler)
+    right_target_xyz, right_target_quat = _compute_arm_target(
+        r_xyz, r_rot, endpose["right_endpose"], model.use_delta, model.use_euler)
+
+    # Format: [left_xyz(3), left_quat(4), left_gripper(1),
+    #          right_xyz(3), right_quat(4), right_gripper(1)]
+    action = np.concatenate([
+        left_target_xyz, left_target_quat, [l_grip],
+        right_target_xyz, right_target_quat, [r_grip],
+    ])
+    TASK_ENV.take_action(action, action_type='ee')
+
+
+# ---------------------------------------------------------------------------
+# Main eval entry point
+# ---------------------------------------------------------------------------
+
 def eval(TASK_ENV, model, observation):
-    # Get instruction
     instruction = TASK_ENV.get_instruction()
 
-    # Prepare images
-    head_img = observation["observation"]["head_camera"]["rgb"]
-    left_img = observation["observation"]["left_camera"]["rgb"]
-    right_img = observation["observation"]["right_camera"]["rgb"]
+    # Prepare images: [head, left, right] to match training order
+    obs_cameras = observation["observation"]
+    images = [obs_cameras["head_camera"]["rgb"],
+              obs_cameras["left_camera"]["rgb"],
+              obs_cameras["right_camera"]["rgb"]]
 
-    # Order: [head, left, right] to match training order
-    images = [head_img, left_img, right_img]
+    example = {"lang": str(instruction), "image": images}
+    if model.use_state:
+        example["state"] = _build_state(model, observation)
 
-    state = observation["joint_action"]["vector"]
-    example = {
-        "lang": str(instruction),
-        "image": images,
-        "state": state,  # Required for delta/rel action modes
-    }
+    raw_action = model.step(example, step=TASK_ENV.take_action_cnt)
+    print(f"Model Action: {raw_action}")
 
-    action = model.step(example, step=TASK_ENV.take_action_cnt)
+    _execute_action(TASK_ENV, model, raw_action, observation)
 
-    # Execute action
-    TASK_ENV.take_action(action)

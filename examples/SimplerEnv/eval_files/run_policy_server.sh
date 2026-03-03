@@ -1,14 +1,37 @@
+#!/bin/bash
 
+# Usage: ./run_policy_server.sh [CHECKPOINT_PATH] [PORT] [GPU_ID]
+# Example: ./run_policy_server.sh /path/to/model.pt 6679 0
 
-cd /mnt/petrelfs/yejinhui/Projects/starVLA
+cd /mnt/cpfs/guchenyang/Code/starVLA
 export PYTHONPATH=$(pwd):${PYTHONPATH}
 
-port=6678
-gpu_id=2
-# export DEBUG=true
-export star_vla_python=/mnt/petrelfs/share/yejinhui/Envs/miniconda3/envs/starVLA/bin/python
+#### Get parameters #####
+# Parameter 1: Checkpoint path
+if [ -n "$1" ]; then
+  your_ckpt="$1"
+else
+  your_ckpt=/mnt/cpfs/guchenyang/Code/starVLA/playground/SimplerEnv/0202_PaligemmaPI_bridgev2_chunk_16/checkpoints/steps_70000_pytorch_model.pt
+fi
 
-your_ckpt=./results/Checkpoints/1208_bridge_rt_1_Qwen3PI/final_model/pytorch_model.pt
+# Parameter 2: Port (default: 6679)
+port=${2:-6678}
+
+# Parameter 3: GPU ID (default: 0)
+gpu_id=${3:-0}
+
+# export DEBUG=true
+# export star_vla_python=/root/miniconda3/envs/starVLA/bin/python
+export star_vla_python=/mnt/cpfs/guchenyang/miniconda3/envs/starvla/bin/python
+
+
+echo "======================================"
+echo "🚀 Starting Policy Server"
+echo "======================================"
+echo "Checkpoint: ${your_ckpt}"
+echo "Port:       ${port}"
+echo "GPU ID:     ${gpu_id}"
+echo "======================================"
 
 #### build output directory #####
 ckpt_dir=$(dirname "${your_ckpt}")

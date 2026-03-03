@@ -1,0 +1,13 @@
+policy_name: starVLA
+task_name: null
+
+# StarVLA Client Parameters
+host: "127.0.0.1"
+port: 5694
+policy_ckpt_path: "/home/robot/guchenyang/Code/StarVLA-Dev/playground/Finetuned/QwenPI/checkpoints/steps_10000_pytorch_model.pt"
+unnorm_key: "r1lite"
+
+# Inference settings
+image_size: [224, 224]
+use_ddim: true
+num_ddim_steps: 4

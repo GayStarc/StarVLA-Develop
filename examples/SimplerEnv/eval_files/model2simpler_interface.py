@@ -14,6 +14,19 @@ from deployment.model_server.tools.websocket_policy_client import WebsocketClien
 from examples.SimplerEnv.eval_files.adaptive_ensemble import AdaptiveEnsembler
 from starVLA.model.tools import read_mode_config
 
+# Import geometry utilities for state preprocessing
+from scipy.spatial.transform import Rotation as R
+
+
+def quat2mat(quat):
+    """Convert quaternion (w, x, y, z) to rotation matrix."""
+    return R.from_quat(np.roll(quat, -1)).as_matrix()
+
+
+def mat2euler(mat):
+    """Convert rotation matrix to euler angles (roll, pitch, yaw)."""
+    return R.from_matrix(mat).as_euler('xyz')
+
 
 
 class ModelClient:
@@ -31,10 +44,11 @@ class ModelClient:
         num_ddim_steps: int = 10,
         action_ensemble = True,
         adaptive_ensemble_alpha = 0.1,
+        use_state: bool = False,  # Whether to use state (proprio) input
         host="0.0.0.0",
         port=10093,
     ) -> None:
-        
+
         # build client to connect server policy
         self.client = WebsocketClientPolicy(host, port)
 
@@ -47,6 +61,8 @@ class ModelClient:
                 # Set 7 for widowx_bridge to fix the window size of motion scale between each frame. see appendix in our paper for details
                 action_ensemble_horizon = 7
             self.sticky_gripper_num_repeat = 1
+            # EE pose in Bridge data was relative to a top-down pose, instead of robot base
+            self.default_rot = np.array([[0, 0, 1.0], [0, 1.0, 0], [-1.0, 0, 0]])
         elif policy_setup == "google_robot":
             unnorm_key = "oxe_rt1" if unnorm_key is None else unnorm_key
             action_ensemble = action_ensemble
@@ -62,7 +78,7 @@ class ModelClient:
         self.policy_setup = policy_setup
         self.unnorm_key = unnorm_key
 
-        print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key} ***")
+        print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key}, use_state: {use_state} ***")
         self.use_ddim = use_ddim
         self.num_ddim_steps = num_ddim_steps
 
@@ -75,6 +91,7 @@ class ModelClient:
         self.action_ensemble = action_ensemble
         self.adaptive_ensemble_alpha = adaptive_ensemble_alpha
         self.action_ensemble_horizon = action_ensemble_horizon
+        self.use_state = use_state  # Store use_state flag
         self.sticky_action_is_on = False
         self.gripper_action_repeat = 0
         self.sticky_gripper_action = 0.0
@@ -89,7 +106,8 @@ class ModelClient:
         self.num_image_history = 0
 
         self.action_norm_stats = self.get_action_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path)
-        
+        self.state_norm_stats = self.get_state_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path) if self.use_state else None
+
 
     def _add_image_to_history(self, image: np.ndarray) -> None:
         self.image_history.append(image)
@@ -107,6 +125,50 @@ class ModelClient:
         self.sticky_gripper_action = 0.0
         self.previous_gripper_action = None
 
+    def preprocess_widowx_proprio(self, eef_pos) -> np.array:
+        """Convert ee rotation to the frame of top-down.
+
+        Args:
+            eef_pos: End-effector position [x, y, z, quat_w, quat_x, quat_y, quat_z, gripper]
+
+        Returns:
+            State array [x, y, z, roll, pitch, yaw, gripper]
+        """
+        proprio = eef_pos
+        rm_bridge = quat2mat(proprio[3:7])
+        rpy_bridge_converted = mat2euler(rm_bridge @ self.default_rot.T)
+        gripper_openness = proprio[7]  # from simpler, 0 for close, 1 for open
+        raw_proprio = np.concatenate(
+            [
+                proprio[:3],
+                rpy_bridge_converted,
+                [gripper_openness],
+            ]
+        )
+        return raw_proprio
+
+    def preprocess_google_robot_proprio(self, eef_pos) -> np.array:
+        """Convert wxyz quat from simpler to xyzw used in fractal.
+
+        Args:
+            eef_pos: End-effector position [x, y, z, quat_w, quat_x, quat_y, quat_z, gripper]
+
+        Returns:
+            State array [x, y, z, quat_x, quat_y, quat_z, quat_w, gripper_closedness]
+        """
+        quat_xyzw = np.roll(eef_pos[3:7], -1)
+        gripper_width = eef_pos[7]  # from simpler, 0 for close, 1 for open
+        # Need invert as the training data comes from closeness
+        gripper_closedness = 1 - gripper_width
+        raw_proprio = np.concatenate(
+            (
+                eef_pos[:3],
+                quat_xyzw,
+                [gripper_closedness],
+            )
+        )
+        return raw_proprio
+
     def step(
         self, image: np.ndarray, task_description: Optional[str] = None, *args, **kwargs
     ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
@@ -114,6 +176,7 @@ class ModelClient:
         Input:
             image: np.ndarray of shape (H, W, 3), uint8
             task_description: Optional[str], task description; if different from previous task description, policy state is reset
+            eef_pos: np.ndarray of shape (8,), end-effector position [x, y, z, quat_w, quat_x, quat_y, quat_z, gripper] (optional, used if use_state=True)
         Output:
             raw_action: dict; raw policy action output
             action: dict; processed action to be sent to the maniskill2 environment, with the following keys:
@@ -128,21 +191,29 @@ class ModelClient:
 
         assert image.dtype == np.uint8
         self._add_image_to_history(self._resize_image(image))
-        # image: Image.Image = Image.fromarray(image)
 
         image = self._resize_image(image)
         example = {
             "image": [image],
             "lang": self.task_description,
         }
-        
-        vla_input = {
-            "examples": [example],
-            "do_sample": False,
-            "cfg_scale": self.cfg_scale,
-            "use_ddim": self.use_ddim,
-            "num_ddim_steps": self.num_ddim_steps,
-        }
+
+        # Add state if use_state is enabled
+        if self.use_state:
+            eef_pos = kwargs.get("eef_pos", None)
+            if eef_pos is not None:
+                if self.policy_setup == "widowx_bridge":
+                    state = self.preprocess_widowx_proprio(eef_pos)
+
+                elif self.policy_setup == "google_robot":
+                    state = self.preprocess_google_robot_proprio(eef_pos)
+                else:
+                    state = None
+
+                if state is not None:
+                    # state_dim matches norm_stats dim (e.g. 7 for bridge: [x, y, z, roll, pitch, yaw, gripper])
+                    state = self.normalize_state(state, self.state_norm_stats)
+                    example["state"] = state[np.newaxis, :].astype(np.float16)
 
         vla_input = {
             "examples": [example],
@@ -156,8 +227,8 @@ class ModelClient:
         
         
         # unnormalize the action
-        normalized_actions = response["data"]["normalized_actions"] # B, chunk, D        
-        normalized_actions = normalized_actions[0]
+        normalized_actions = response["data"]["normalized_actions"] # B, chunk, D
+        normalized_actions = normalized_actions[0, :, :7]  # Take only first 7 dimensions from 14-dim output
         
         
         raw_actions = self.unnormalize_actions(normalized_actions=normalized_actions, action_norm_stats=self.action_norm_stats)
@@ -239,7 +310,29 @@ class ModelClient:
         # unnorm_key = baseframework._check_unnorm_key(norm_stats, unnorm_key) # 其实也是很环境 specific 的
         return norm_stats[unnorm_key]["action"]
 
+    @staticmethod
+    def get_state_stats(unnorm_key: str, policy_ckpt_path) -> dict:
+        policy_ckpt_path = Path(policy_ckpt_path)
+        model_config, norm_stats = read_mode_config(policy_ckpt_path)
+        return norm_stats[unnorm_key]["state"]
 
+    @staticmethod
+    def normalize_state(state: np.ndarray, state_norm_stats: Dict[str, np.ndarray]) -> np.ndarray:
+        """Normalize state using q99 mode (q01/q99 mapped to [-1, 1]), with binary for non-masked dims."""
+        mask = state_norm_stats.get("mask", None)
+        q01 = np.array(state_norm_stats["q01"])
+        q99 = np.array(state_norm_stats["q99"])
+        if mask is None:
+            mask = q01 != q99
+        else:
+            mask = np.array(mask, dtype=bool)
+        normalized = np.copy(state).astype(np.float32)
+        # q99 normalization for continuous dims
+        normalized[mask] = 2.0 * (state[mask] - q01[mask]) / (q99[mask] - q01[mask]) - 1.0
+        normalized[mask] = np.clip(normalized[mask], -1, 1)
+        # Binary normalization for non-masked dims (e.g. gripper)
+        normalized[~mask] = (state[~mask] > 0.5).astype(np.float32)
+        return normalized
 
     def _resize_image(self, image: np.ndarray) -> np.ndarray:
         image = cv.resize(image, tuple(self.image_size), interpolation=cv.INTER_AREA)

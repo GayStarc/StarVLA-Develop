@@ -23,6 +23,12 @@ def get_args():
         help="Policy model type; e.g., 'rt1', 'octo-base', 'octo-small'",
     )
     parser.add_argument(
+        "--unnorm-key",
+        type=str,
+        default="widowx",
+        help="Policy model setup; e.g., 'google_robot', 'widowx_bridge'",
+    )
+    parser.add_argument(
         "--policy-setup",
         type=str,
         default="google_robot",
@@ -118,6 +124,9 @@ def get_args():
     parser.add_argument("--async-freq", type=int, default=1)
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Octo init rng seed")
     parser.add_argument("--port", type=int, default=10093)
+    parser.add_argument("--use-state", action="store_true", help="Use state (proprio) input for model inference")
+    parser.add_argument("--no-use-state", dest="use_state", action="store_false", help="Disable state (proprio) input for model inference")
+    parser.set_defaults(use_state=True)  # Default to True
 
 
     args = parser.parse_args()

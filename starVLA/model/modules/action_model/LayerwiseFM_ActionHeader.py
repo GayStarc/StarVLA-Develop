@@ -211,6 +211,9 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
 
 DiTConfig = {"num_layers": 36, "input_embedding_dim": 2048, "attention_head_dim": 64, "num_attention_heads": 32} # default for qwen2.5-vl
 
+# DiTConfig = {"num_layers": 18, "input_embedding_dim": 2048, "attention_head_dim": 64, "num_attention_heads": 32} # default for paligemma
+
+
 
 class LayerwiseFlowmatchingActionHead(nn.Module):
     def __init__(
@@ -277,7 +280,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         device = actions.device
         num_layers = len(vl_embs_list)
         B, L, D = vl_embs_list[0].shape
-        # Embed noised action trajectory.
+        # Flow matching: t=0 -> noise, t=1 -> clean action
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
         t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
         t = t[:, None, None]  # shape (B,1,1) for broadcast
@@ -321,11 +324,12 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
 
         # Slice out only the action portion of pred and target.
         loss = ((pred_actions - velocity) ** 2).mean()
+
         return loss
 
     @torch.no_grad()
     def predict_action(self, vl_embs_list: list, state: torch.Tensor = None) -> torch.Tensor:
-        # Set initial actions as the sampled noise.
+        """Euler integration from t=0 (noise) to t=1 (clean action)."""
         batch_size = vl_embs_list[0].shape[0]
         device = vl_embs_list[0].device
         actions = torch.randn(
@@ -339,7 +343,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
 
         state_features = self.state_encoder(state) if state is not None else None
 
-        # Run denoising steps.
+        # Run denoising steps from t=0 → t=1
         for t in range(num_steps):
             t_cont = t / float(num_steps)
             t_discretized_int = int(t_cont * self.num_timestep_buckets)
@@ -347,10 +351,8 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 size=(batch_size,), fill_value=t_discretized_int, device=device, dtype=torch.long
             )
 
-            # Embed current action trajectory with timestep
             action_features = self.action_encoder(actions, timesteps_tensor)
 
-            # Maybe add position embedding.
             if self.config.add_pos_embed:
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
                 pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
@@ -363,10 +365,8 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 else torch.cat((future_tokens, action_features), dim=1)
             )
 
-            # Encode timestep
             temb = self.model.timestep_encoder(timesteps_tensor)
 
-            # Layerwise cross-attention with vl_embs_list
             model_output = sa_embs
             for layer_idx, layer in enumerate(self.model.transformer_blocks):
                 model_output = layer(
@@ -374,9 +374,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                     encoder_hidden_states=vl_embs_list[layer_idx],
                     temb=temb,
                 )
-            # TODO miss self att and _process_output 
+
             pred = self.action_decoder(model_output)
-            pred_velocity = pred[:, -self.action_horizon :]
+            pred_velocity = pred[:, -self.action_horizon:]
 
             # Euler integration
             actions = actions + dt * pred_velocity

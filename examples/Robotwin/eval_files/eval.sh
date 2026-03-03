@@ -1,11 +1,11 @@
 #!/bin/bash
 
-ROBOTWIN_PATH=/mnt/data/gaoning/code_repos/RoboTwin
+ROBOTWIN_PATH=/mnt/cpfs/guchenyang/Code/RoboTwin
 
 policy_name="model2robotwin_interface"
-task_name=${1}
-task_config=${2}
-ckpt_setting=${3:-starvla_demo}
+task_name=${1:-adjust_bottle}
+task_config=${2:-demo_clean}
+ckpt_setting=${3:-qwen3_4b_oft_easy_10tasks_joint_absolute}
 seed=${4:-0}
 gpu_id=${5:-0} # default is 0
 
@@ -25,6 +25,7 @@ cd $ROBOTWIN_PATH
 echo "PYTHONPATH: $PYTHONPATH"
 
 PYTHONWARNINGS=ignore::UserWarning \
+# export CUROBO_TORCH_COMPILE_DISABLE=0
 python script/eval_policy.py --config $DEPLOY_POLICY_PATH \
     --overrides \
     --task_name ${task_name} \

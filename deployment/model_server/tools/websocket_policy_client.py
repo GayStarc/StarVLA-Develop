@@ -49,8 +49,8 @@ class WebsocketClientPolicy:
                     max_size=None,
                     additional_headers=headers,
                     open_timeout=150,
-                    ping_interval=20,
-                    ping_timeout=20,
+                    ping_interval=60,   # 并行评测时服务端可能繁忙，需更长间隔
+                    ping_timeout=120,  # 推理耗时较长，放宽 ping 超时
                 )
                 metadata = msgpack_numpy.unpackb(conn.recv())
                 return conn, metadata
