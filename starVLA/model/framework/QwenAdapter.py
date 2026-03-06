@@ -27,7 +27,7 @@ IGNORE_INDEX = -100
 
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.modules.vlm import get_vlm_model
-from starVLA.model.modules.action_model.VLA_AdapterHeader import get_action_model, VLA_Adapter_L1RegressionActionHead
+from starVLA.model.modules.action_model.VLA_AdapterHeader import get_action_model, L1RegressionActionHead
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.model.modules.vlm.QWen3 import IMAGE_TOKEN_INDEX, VIDEO_TOKEN_INDEX
@@ -96,7 +96,7 @@ class Qwen_Adapter(baseframework):
         self.qwen_vl_interface = get_vlm_model(config=self.config)
         self.config.framework.qwenvl.vl_hidden_dim = self.qwen_vl_interface.model.config.hidden_size
         self.action_query_num = self.config.framework.action_model.get("action_query_num", 64)
-        self.action_model: VLA_Adapter_L1RegressionActionHead = get_action_model(config=self.config)
+        self.action_model: L1RegressionActionHead = get_action_model(config=self.config)
         self.action_query = nn.Parameter(torch.randn(self.action_query_num, self.qwen_vl_interface.model.config.hidden_size))
         self.dummy_action_token = "🔍" # TODO also can add spacail token to Qwen, but too complex
         self.dummy_action_token_id = self.qwen_vl_interface.processor.tokenizer("🔍", add_special_tokens=False)["input_ids"][0]

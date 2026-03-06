@@ -225,24 +225,38 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         action_config = global_config.framework.action_model
         diffusion_model_cfg = action_config.diffusion_model_cfg
 
-        # 更新 DiTConfig 到 diffusion_model_cfg
-        DiTConfig["num_layers"] = global_config.framework.qwenvl.num_vl_layers
-        DiTConfig["input_embedding_dim"] = global_config.framework.qwenvl.vl_hidden_dim
-        DiTConfig["num_attention_heads"] = DiTConfig["input_embedding_dim"] // DiTConfig["attention_head_dim"]
-        diffusion_model_cfg.update(DiTConfig)
-        # diffusion_model_cfg["interleave_self_attention"] = False
-        diffusion_model_cfg.cross_attention_dim = DiTConfig["input_embedding_dim"] # should match vl embedding dim, but for some case we might want to change it for cross + self attention
-        self.input_embedding_dim = global_config.framework.qwenvl.vl_hidden_dim
-        self.model = DiT(**diffusion_model_cfg) # TODO better way is copy LLM from VLM
+        # Configure DiT dimensions
+        vl_hidden_dim = global_config.framework.qwenvl.vl_hidden_dim
+        action_hidden_dim = getattr(action_config, 'action_hidden_dim', vl_hidden_dim)
+
+        if action_hidden_dim != vl_hidden_dim:
+            # Independent action head: smaller DiT hidden size, cross-attention bridges to VLM
+            attention_head_dim = DiTConfig["attention_head_dim"]  # 64
+            diffusion_model_cfg["input_embedding_dim"] = action_hidden_dim
+            diffusion_model_cfg["num_attention_heads"] = action_hidden_dim // attention_head_dim
+            diffusion_model_cfg["attention_head_dim"] = attention_head_dim
+            diffusion_model_cfg["cross_attention_dim"] = vl_hidden_dim
+            # num_layers uses the value from yaml config
+            self.input_embedding_dim = action_hidden_dim
+        else:
+            # Legacy behavior: DiT hidden size matches VLM hidden size
+            DiTConfig["num_layers"] = global_config.framework.qwenvl.num_vl_layers
+            DiTConfig["input_embedding_dim"] = vl_hidden_dim
+            DiTConfig["num_attention_heads"] = DiTConfig["input_embedding_dim"] // DiTConfig["attention_head_dim"]
+            diffusion_model_cfg.update(DiTConfig)
+            diffusion_model_cfg["cross_attention_dim"] = DiTConfig["input_embedding_dim"]
+            self.input_embedding_dim = vl_hidden_dim
+        self.model = DiT(**diffusion_model_cfg)
         self.dit_out_hidden_size = self.input_embedding_dim
         self.action_dim = action_config.action_dim
         self.action_horizon = action_config.future_action_window_size + 1
         self.num_inference_timesteps = action_config.num_inference_timesteps
 
+        self.use_state = getattr(action_config, 'use_state', True) and bool(action_config.state_dim)
         self.state_encoder = MLP(
             input_dim=action_config.state_dim,
             output_dim=self.input_embedding_dim,
-        ) if action_config.state_dim else None
+        ) if self.use_state else None
 
         self.action_encoder = ActionEncoder(
             action_dim=action_config.action_dim,

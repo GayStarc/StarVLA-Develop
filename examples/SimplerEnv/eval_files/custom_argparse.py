@@ -127,6 +127,14 @@ def get_args():
     parser.add_argument("--use-state", action="store_true", help="Use state (proprio) input for model inference")
     parser.add_argument("--no-use-state", dest="use_state", action="store_false", help="Disable state (proprio) input for model inference")
     parser.set_defaults(use_state=True)  # Default to True
+    parser.add_argument(
+        "--action-chunk-size",
+        type=int,
+        default=None,
+        help="Use only the first N actions from model output chunk (optional)",
+    )
+    parser.add_argument("--model-state-dim", type=int, default=None,
+        help="Pad state to this dimension for models trained with larger state dims (e.g., 14 for hand-bridge)")
 
 
     args = parser.parse_args()

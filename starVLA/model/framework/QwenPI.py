@@ -75,7 +75,58 @@ class Qwen_PI(baseframework):
         self.future_action_window_size = config.framework.action_model.future_action_window_size
         self.past_action_window_size = config.framework.action_model.past_action_window_size
         self.chunk_len = self.past_action_window_size + 1 + self.future_action_window_size
-        
+
+        # --- Detailed parameter counting ---
+        self._print_parameter_summary()
+
+
+    @staticmethod
+    def _count_params(module):
+        total = sum(p.numel() for p in module.parameters())
+        trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        return total, trainable
+
+    def _print_parameter_summary(self):
+        def fmt(n):
+            if n >= 1e9:
+                return f"{n/1e9:.2f}B"
+            if n >= 1e6:
+                return f"{n/1e6:.2f}M"
+            if n >= 1e3:
+                return f"{n/1e3:.2f}K"
+            return str(n)
+
+        vlm_total, vlm_train = self._count_params(self.qwen_vl_interface)
+        ah = self.action_model
+        ah_total, ah_train = self._count_params(ah)
+
+        # Action head breakdown
+        dit_total, dit_train = self._count_params(ah.model)
+        enc_total, enc_train = self._count_params(ah.action_encoder)
+        dec_total, dec_train = self._count_params(ah.action_decoder)
+        ft_total = ah.future_tokens.weight.numel()
+        pe_total = ah.position_embedding.weight.numel() if hasattr(ah, 'position_embedding') else 0
+        se_total, se_train = self._count_params(ah.state_encoder) if ah.state_encoder is not None else (0, 0)
+
+        overall_total = vlm_total + ah_total
+        overall_train = vlm_train + ah_train
+
+        logger.info("=" * 60)
+        logger.info("  Parameter Summary")
+        logger.info("=" * 60)
+        logger.info(f"  VLM           : {fmt(vlm_total):>8s} total | {fmt(vlm_train):>8s} trainable")
+        logger.info(f"  Action Head   : {fmt(ah_total):>8s} total | {fmt(ah_train):>8s} trainable")
+        logger.info("-" * 60)
+        logger.info(f"    DiT blocks      : {fmt(dit_total):>8s} total | {fmt(dit_train):>8s} trainable")
+        logger.info(f"    Action encoder  : {fmt(enc_total):>8s} total | {fmt(enc_train):>8s} trainable")
+        logger.info(f"    Action decoder  : {fmt(dec_total):>8s} total | {fmt(dec_train):>8s} trainable")
+        logger.info(f"    State encoder   : {fmt(se_total):>8s} total | {fmt(se_train):>8s} trainable")
+        logger.info(f"    Future tokens   : {fmt(ft_total):>8s}")
+        logger.info(f"    Position embed  : {fmt(pe_total):>8s}")
+        logger.info("=" * 60)
+        logger.info(f"  Overall       : {fmt(overall_total):>8s} total | {fmt(overall_train):>8s} trainable")
+        logger.info(f"  Action/VLM ratio  : {ah_total/vlm_total:.2%}")
+        logger.info("=" * 60)
 
     def forward(
         self,
@@ -96,7 +147,7 @@ class Qwen_PI(baseframework):
         instructions = [example["lang"] for example in examples]  # [B, str]
         actions = [example["action"] for example in examples]  # label [B， len, 7]
         
-        state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
+        state = [example["state"] for example in examples] if ("state" in examples[0] and self.action_model.use_state) else None  # [B, 1, state_dim]
         
 
         # Step 1: QWenVL input format
@@ -165,7 +216,7 @@ class Qwen_PI(baseframework):
         batch_images = [to_pil_preserve(example["image"]) for example in examples]  #  [B，[PLT]]
         instructions = [example["lang"] for example in examples]  # [B, str]
     
-        state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
+        state = [example["state"] for example in examples] if ("state" in examples[0] and self.action_model.use_state) else None  # [B, 1, state_dim]
         
         train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
         if train_obs_image_size:

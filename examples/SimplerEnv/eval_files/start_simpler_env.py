@@ -35,6 +35,8 @@ if __name__ == "__main__":
         action_scale=args.action_scale,
         cfg_scale=1.5,                  # cfg from 1.5 to 7 also performs well
         use_state=args.use_state,
+        action_chunk_size=args.action_chunk_size,
+        model_state_dim=args.model_state_dim,
     )
 
     # policy model creation; update this if you are using a new policy model

@@ -45,6 +45,8 @@ class ModelClient:
         action_ensemble = True,
         adaptive_ensemble_alpha = 0.1,
         use_state: bool = False,  # Whether to use state (proprio) input
+        action_chunk_size: Optional[int] = None,  # Optionally truncate model action chunk to first N actions
+        model_state_dim: Optional[int] = None,  # Pad state to this dim for models trained with larger state dims
         host="0.0.0.0",
         port=10093,
     ) -> None:
@@ -90,8 +92,12 @@ class ModelClient:
         self.horizon = horizon #0
         self.action_ensemble = action_ensemble
         self.adaptive_ensemble_alpha = adaptive_ensemble_alpha
+        self.action_chunk_size = action_chunk_size
         self.action_ensemble_horizon = action_ensemble_horizon
+        if self.action_chunk_size is not None and self.action_chunk_size > 0:
+            self.action_ensemble_horizon = min(self.action_ensemble_horizon, self.action_chunk_size)
         self.use_state = use_state  # Store use_state flag
+        self.model_state_dim = model_state_dim  # Pad state to this dim (e.g., 14 for hand-bridge model)
         self.sticky_action_is_on = False
         self.gripper_action_repeat = 0
         self.sticky_gripper_action = 0.0
@@ -213,6 +219,9 @@ class ModelClient:
                 if state is not None:
                     # state_dim matches norm_stats dim (e.g. 7 for bridge: [x, y, z, roll, pitch, yaw, gripper])
                     state = self.normalize_state(state, self.state_norm_stats)
+                    # Pad to model's expected state_dim (e.g., 14 for hand-bridge model)
+                    if self.model_state_dim is not None and state.shape[0] < self.model_state_dim:
+                        state = np.pad(state, (0, self.model_state_dim - state.shape[0]), mode='constant')
                     example["state"] = state[np.newaxis, :].astype(np.float16)
 
         vla_input = {
@@ -221,6 +230,9 @@ class ModelClient:
             "use_ddim": self.use_ddim,
             "num_ddim_steps": self.num_ddim_steps,
         }
+        if self.action_chunk_size is not None and self.action_chunk_size > 0:
+            vla_input["action_chunk_size"] = self.action_chunk_size
+        vla_input["use_state"] = self.use_state
         
    
         response = self.client.predict_action(vla_input)
@@ -229,6 +241,8 @@ class ModelClient:
         # unnormalize the action
         normalized_actions = response["data"]["normalized_actions"] # B, chunk, D
         normalized_actions = normalized_actions[0, :, :7]  # Take only first 7 dimensions from 14-dim output
+        if self.action_chunk_size is not None and self.action_chunk_size > 0:
+            normalized_actions = normalized_actions[: self.action_chunk_size]
         
         
         raw_actions = self.unnormalize_actions(normalized_actions=normalized_actions, action_norm_stats=self.action_norm_stats)
@@ -319,13 +333,15 @@ class ModelClient:
     @staticmethod
     def normalize_state(state: np.ndarray, state_norm_stats: Dict[str, np.ndarray]) -> np.ndarray:
         """Normalize state using q99 mode (q01/q99 mapped to [-1, 1]), with binary for non-masked dims."""
+        # Align stats dims with state dims (e.g., 8-dim stats truncated to 7 for 7-dim state)
+        state_dim = state.shape[0]
         mask = state_norm_stats.get("mask", None)
-        q01 = np.array(state_norm_stats["q01"])
-        q99 = np.array(state_norm_stats["q99"])
+        q01 = np.array(state_norm_stats["q01"])[:state_dim]
+        q99 = np.array(state_norm_stats["q99"])[:state_dim]
         if mask is None:
             mask = q01 != q99
         else:
-            mask = np.array(mask, dtype=bool)
+            mask = np.array(mask, dtype=bool)[:state_dim]
         normalized = np.copy(state).astype(np.float32)
         # q99 normalization for continuous dims
         normalized[mask] = 2.0 * (state[mask] - q01[mask]) / (q99[mask] - q01[mask]) - 1.0

@@ -57,8 +57,9 @@ datasets:
     lerobot_version: v3.0
 
 trainer:
-  epochs: 100
-  max_train_steps: 100000
+  training_mode: step
+  epochs: 500
+  max_train_steps: 50000
   num_warmup_steps: 5000
   save_interval: 10000
   eval_interval: 100

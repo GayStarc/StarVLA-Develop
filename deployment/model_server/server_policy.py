@@ -10,6 +10,52 @@ from starVLA.model.framework.base_framework import baseframework
 import torch, os
 
 
+class PolicyRequestOverride:
+    """Apply optional request-level overrides without changing framework code."""
+
+    def __init__(self, policy, default_action_chunk_size=None, default_use_state=None):
+        self._policy = policy
+        self._default_action_chunk_size = default_action_chunk_size
+        self._default_use_state = default_use_state
+
+    def __getattr__(self, name):
+        return getattr(self._policy, name)
+
+    def predict_action(self, **msg):
+        action_chunk_size = msg.pop("action_chunk_size", self._default_action_chunk_size)
+        use_state = msg.pop("use_state", self._default_use_state)
+
+        examples = msg.get("examples", None)
+        if isinstance(examples, list) and use_state is not None:
+            filtered_examples = []
+            for example in examples:
+                if isinstance(example, dict):
+                    copied = dict(example)
+                    if not use_state:
+                        copied.pop("state", None)
+                    filtered_examples.append(copied)
+                else:
+                    filtered_examples.append(example)
+            msg["examples"] = filtered_examples
+
+        output = self._policy.predict_action(**msg)
+        if (
+            action_chunk_size is not None
+            and isinstance(output, dict)
+            and "normalized_actions" in output
+        ):
+            try:
+                action_chunk_size = int(action_chunk_size)
+            except (TypeError, ValueError):
+                return output
+            if action_chunk_size > 0:
+                normalized_actions = output["normalized_actions"]
+                if hasattr(normalized_actions, "ndim") and normalized_actions.ndim >= 2:
+                    output = dict(output)
+                    output["normalized_actions"] = normalized_actions[:, :action_chunk_size, ...]
+        return output
+
+
 def main(args) -> None:
     # Example usage:
     # policy = YourPolicyClass()  # Replace with your actual policy class
@@ -23,6 +69,11 @@ def main(args) -> None:
     if args.use_bf16: # False
         vla = vla.to(torch.bfloat16)
     vla = vla.to("cuda").eval()
+    vla = PolicyRequestOverride(
+        vla,
+        default_action_chunk_size=args.action_chunk_size,
+        default_use_state=args.use_state,
+    )
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
@@ -46,6 +97,25 @@ def build_argparser():
     parser.add_argument("--port", type=int, default=10093)
     parser.add_argument("--use_bf16", action="store_true")
     parser.add_argument("--idle_timeout" , type=int, default=1800, help="Idle timeout in seconds, -1 means never close")
+    parser.add_argument(
+        "--action-chunk-size",
+        type=int,
+        default=None,
+        help="Truncate returned normalized actions to this chunk size (optional)",
+    )
+    parser.add_argument(
+        "--use-state",
+        dest="use_state",
+        action="store_true",
+        help="Force keeping state input in request examples",
+    )
+    parser.add_argument(
+        "--no-use-state",
+        dest="use_state",
+        action="store_false",
+        help="Force dropping state input in request examples",
+    )
+    parser.set_defaults(use_state=None)
     return parser
 
 

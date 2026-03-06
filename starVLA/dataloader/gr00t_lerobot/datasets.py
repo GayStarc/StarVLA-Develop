@@ -1292,6 +1292,11 @@ class LeRobotSingleDataset(Dataset):
         for action_key in self.modality_keys["action"]:
             action.append(data[action_key])
         action = np.concatenate(action, axis=1).astype(np.float16)
+        action = self._pad_feature_dim(
+            action,
+            requested_dim=self._resolve_target_dim("action"),
+            feature_name="action",
+        )
 
         sample = {
             "action": action,
@@ -1305,9 +1310,41 @@ class LeRobotSingleDataset(Dataset):
             for state_key in self.modality_keys["state"]:
                 state.append(data[state_key])
             state = np.concatenate(state, axis=1).astype(np.float16)
+            state = self._pad_feature_dim(
+                state,
+                requested_dim=self._resolve_target_dim("state"),
+                feature_name="state",
+            )
             sample["state"] = state
 
         return sample
+
+    def _resolve_target_dim(self, modality: str) -> int | None:
+        """Resolve desired feature dim from YAML (`target_*_dim`) or robot config defaults."""
+        assert modality in {"action", "state"}
+        yaml_key = f"target_{modality}_dim"
+        dataset_key = f"target_{modality}_dim"
+        cfg_dim = self.data_cfg.get(yaml_key) if self.data_cfg is not None else None
+        ds_dim = getattr(self, dataset_key, None)
+        return cfg_dim if cfg_dim is not None else ds_dim
+
+    @staticmethod
+    def _pad_feature_dim(feature: np.ndarray, requested_dim: int | None, feature_name: str) -> np.ndarray:
+        """Right-pad feature last dim with zeros to requested_dim when needed."""
+        if requested_dim is None:
+            return feature
+
+        current_dim = feature.shape[-1]
+        if current_dim == requested_dim:
+            return feature
+        if current_dim > requested_dim:
+            raise ValueError(
+                f"{feature_name} dim mismatch: got {current_dim}, requested {requested_dim}."
+            )
+
+        pad_width = requested_dim - current_dim
+        padded = np.pad(feature, ((0, 0), (0, pad_width)), mode="constant")
+        return padded.astype(feature.dtype, copy=False)
 
     def get_step_data(self, trajectory_id: int, base_index: int) -> dict:
         """Get the RAW data for a single step in a trajectory. No transforms are applied.
@@ -1852,6 +1889,7 @@ class CachedLeRobotSingleDataset(LeRobotSingleDataset):
             # Get the data corresponding to each key in the modality
             for key in self.modality_keys[modality]:
                 data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
+        # data = self._apply_action_mode(data)
         return data
 
     def set_transforms_metadata(self, metadata: DatasetMetadata):

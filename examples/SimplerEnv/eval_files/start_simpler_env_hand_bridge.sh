@@ -1,0 +1,175 @@
+#!/bin/bash
+
+echo `which python`
+
+export sim_python=/mnt/ckp/guchenyang/Miniconda3/envs/simpler/bin/python
+export SimplerEnv_PATH=/mnt/ckp/guchenyang/Code/SimplerEnv-Dev
+export PYTHONPATH=$(pwd):${PYTHONPATH}
+#### set environment variables #####
+export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/nvidia_icd.json"
+
+
+#### get parameters #####
+if [ -n "$1" ]; then
+  MODEL_PATH="$1"
+else
+  MODEL_PATH=/mnt/ckp/guchenyang/Code/StarVLA-Develop/playground/Hand-Pretrain/0302_Qwen3_4B_PI_Hand_Bridge_Pretrain/checkpoints/epoch_1_steps_29382_pytorch_model.pt
+fi
+
+port=${2:-6678}
+
+if [ -n "$3" ]; then
+  video_dir_name="$3"
+else
+  video_dir_name="Simpler/0302_Hand_Bridge_Pretrain/test"
+fi
+
+# Parameter 4: Action chunk size (optional; empty means use full model chunk)
+action_chunk_size="${4:-}"
+
+# Parameter 5: Use state input (default: true). Accepts: true/false, y/n, 1/0
+use_state_input="${5:-true}"
+case "${use_state_input,,}" in
+  true|t|yes|y|1)
+    use_state_flag="--use-state"
+    use_state_enabled=true
+    ;;
+  false|f|no|n|0)
+    use_state_flag="--no-use-state"
+    use_state_enabled=false
+    ;;
+  *)
+    echo "Invalid use_state value: ${use_state_input}. Use true/false (or y/n, 1/0)."
+    exit 1
+    ;;
+esac
+
+action_chunk_args=()
+if [ -n "${action_chunk_size}" ]; then
+  action_chunk_args=(--action-chunk-size "${action_chunk_size}")
+fi
+
+model_state_dim_args=()
+if [ "${use_state_enabled}" = true ]; then
+  model_state_dim_args=(--model-state-dim 14)
+fi
+
+# Setup logging directory for videos
+logging_dir="./results/${video_dir_name}"
+mkdir -p "${logging_dir}"
+echo "Videos will be saved to: ${logging_dir}"
+
+#### build output directory #####
+ckpt_path=${MODEL_PATH}
+ckpt_dir=$(dirname "${ckpt_path}")
+ckpt_base=$(basename "${ckpt_path}")
+ckpt_name="${ckpt_base%.*}"
+
+output_server_dir="${ckpt_dir}/output_server"
+output_eval_dir="${ckpt_dir}/output_eval"
+mkdir -p "${output_server_dir}"
+mkdir -p "${output_eval_dir}"
+
+TSET_NUM=1
+
+IFS=',' read -r -a CUDA_DEVICES <<< "$CUDA_VISIBLE_DEVICES"
+NUM_GPUS=${#CUDA_DEVICES[@]}
+
+echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+echo "CUDA_DEVICES: ${CUDA_DEVICES[@]}"
+echo "NUM_GPUS: $NUM_GPUS"
+echo "Action chunk size: ${action_chunk_size:-full model chunk}"
+echo "Use state input: ${use_state_enabled}"
+
+scene_name=bridge_table_1_v1
+robot=widowx
+rgb_overlay_path=${SimplerEnv_PATH}/ManiSkill2_real2sim/data/real_inpainting/bridge_real_eval_1.png
+robot_init_x=0.147
+robot_init_y=0.028
+
+declare -a ENV_NAMES=(
+  StackGreenCubeOnYellowCubeBakedTexInScene-v0
+  PutCarrotOnPlateInScene-v0
+  PutSpoonOnTableClothInScene-v0
+)
+
+for i in "${!ENV_NAMES[@]}"; do
+  env="${ENV_NAMES[i]}"
+  for ((run_idx=1; run_idx<=TSET_NUM; run_idx++)); do
+    task_log="${output_eval_dir}/${ckpt_name}_${env}_run${run_idx}.log"
+    echo "Launching task [${env}] run#${run_idx}, log -> ${task_log}"
+
+    ${sim_python} examples/SimplerEnv/eval_files/start_simpler_env.py \
+      --ckpt-path ${ckpt_path} \
+      --port ${port} \
+      --robot ${robot} \
+      --unnorm-key new_embodiment \
+      --policy-setup widowx_bridge \
+      --control-freq 5 \
+      --sim-freq 500 \
+      --max-episode-steps 80 \
+      --env-name "${env}" \
+      --scene-name ${scene_name} \
+      --rgb-overlay-path ${rgb_overlay_path} \
+      --robot-init-x ${robot_init_x} ${robot_init_x} 1 \
+      --robot-init-y ${robot_init_y} ${robot_init_y} 1 \
+      --obj-variation-mode episode \
+      --obj-episode-range 0 50 \
+      --robot-init-rot-quat-center 0 0 0 1 \
+      --robot-init-rot-rpy-range 0 0 1 0 0 1 0 0 1 \
+      --logging-dir "${logging_dir}" \
+      ${use_state_flag} \
+      "${action_chunk_args[@]}" \
+      "${model_state_dim_args[@]}" \
+      > "${task_log}" 2>&1 &
+
+    sleep 6
+
+  done
+done
+
+declare -a ENV_NAMES_V2=(
+  PutEggplantInBasketScene-v0
+)
+
+scene_name=bridge_table_1_v2
+robot=widowx_sink_camera_setup
+rgb_overlay_path=${SimplerEnv_PATH}/ManiSkill2_real2sim/data/real_inpainting/bridge_sink.png
+robot_init_x=0.127
+robot_init_y=0.06
+
+for i in "${!ENV_NAMES_V2[@]}"; do
+  env="${ENV_NAMES_V2[i]}"
+  for ((run_idx=1; run_idx<=TSET_NUM; run_idx++)); do
+    task_log="${output_eval_dir}/${ckpt_name}_${env}_run${run_idx}.log"
+    echo "Launching V2 task [${env}] run#${run_idx}, log -> ${task_log}"
+
+    ${sim_python} examples/SimplerEnv/eval_files/start_simpler_env.py \
+      --ckpt-path ${ckpt_path} \
+      --port ${port} \
+      --robot ${robot} \
+      --unnorm-key new_embodiment \
+      --policy-setup widowx_bridge \
+      --control-freq 5 \
+      --sim-freq 500 \
+      --max-episode-steps 80 \
+      --env-name "${env}" \
+      --scene-name ${scene_name} \
+      --rgb-overlay-path ${rgb_overlay_path} \
+      --robot-init-x ${robot_init_x} ${robot_init_x} 1 \
+      --robot-init-y ${robot_init_y} ${robot_init_y} 1 \
+      --obj-variation-mode episode \
+      --obj-episode-range 0 50 \
+      --robot-init-rot-quat-center 0 0 0 1 \
+      --robot-init-rot-rpy-range 0 0 1 0 0 1 0 0 1 \
+      --logging-dir "${logging_dir}" \
+      ${use_state_flag} \
+      "${action_chunk_args[@]}" \
+      "${model_state_dim_args[@]}" \
+      > "${task_log}" 2>&1 &
+
+    sleep 6
+  done
+done
+
+echo "Finished"
