@@ -94,6 +94,12 @@ def eval_libero(args: Args) -> None:
         image_size=args.resize_size,
         use_state=args.use_state,
     )
+    if client_model.use_state != args.use_state:
+        logging.info(
+            "Adjusted LIBERO eval state usage from requested=%s to resolved=%s based on checkpoint config.",
+            args.use_state,
+            client_model.use_state,
+        )
 
 
     # Start evaluation
@@ -174,7 +180,7 @@ def eval_libero(args: Args) -> None:
                     "lang": observation["instruction"][0],
                 }
 
-                if args.use_state:
+                if client_model.use_state:
                     example_dict["state"] = state
 
                 

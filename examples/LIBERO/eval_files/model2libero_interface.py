@@ -1,6 +1,7 @@
 from collections import deque
 from typing import Optional, Sequence
 import os
+import logging
 import cv2 as cv
 import matplotlib.pyplot as plt
 import numpy as np
@@ -33,14 +34,32 @@ class ModelClient:
         host="0.0.0.0",
         port=10095,
     ) -> None:
-        
+
         # build client to connect server policy
         self.client = WebsocketClientPolicy(host, port)
         self.policy_setup = policy_setup
         self.unnorm_key = unnorm_key
 
-        self.use_state = use_state
-        print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key}, use_state: {use_state} ***")
+        self.model_uses_state = self.checkpoint_uses_state(policy_ckpt_path)
+        force_no_state = os.getenv("STARVLA_FORCE_NO_STATE", "").lower() in {"1", "true", "yes"}
+        if force_no_state:
+            self.use_state = False
+            if self.model_uses_state:
+                logging.warning("Checkpoint uses proprio state, but STARVLA_FORCE_NO_STATE is set; disabling state input.")
+        elif self.model_uses_state and not use_state:
+            self.use_state = True
+            logging.warning(
+                "Checkpoint expects proprio state (state_dim > 0); auto-enabling state for LIBERO eval."
+            )
+        elif use_state and not self.model_uses_state:
+            self.use_state = False
+            logging.warning("Checkpoint does not use proprio state; ignoring requested use_state=True.")
+        else:
+            self.use_state = use_state
+        print(
+            f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key}, "
+            f"use_state: {self.use_state}, model_uses_state: {self.model_uses_state} ***"
+        )
         self.use_ddim = use_ddim
         self.num_ddim_steps = num_ddim_steps
         self.image_size = image_size
@@ -64,6 +83,7 @@ class ModelClient:
         self.action_norm_stats = self.get_action_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path)
         self.action_chunk_size = self.get_action_chunk_size(policy_ckpt_path=policy_ckpt_path)
         self.state_norm_stats = self.get_state_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path) if self.use_state else None
+        self.raw_actions = None
         
 
     def _add_image_to_history(self, image: np.ndarray) -> None:
@@ -106,11 +126,12 @@ class ModelClient:
         images = [self._resize_image(image) for image in images]
         example["image"] = images
 
-        # Normalize state if use_state is enabled
+        # Pass state through (raw, unnormalized) to match training data pipeline.
+        # The Libero4in1DataConfig does NOT normalize state during training,
+        # so eval must also send raw state values.
         if self.use_state:
             state = example.get("state", None)
             if state is not None:
-                state = self.normalize_state(state, self.state_norm_stats)
                 example["state"] = state[np.newaxis, :].astype(np.float16)
 
         vla_input = {
@@ -173,6 +194,16 @@ class ModelClient:
         model_config, _ = read_mode_config(policy_ckpt_path)  # read config and norm_stats
         # import ipdb; ipdb.set_trace()
         return model_config['framework']['action_model']['future_action_window_size'] + 1
+
+    @staticmethod
+    def checkpoint_uses_state(policy_ckpt_path) -> bool:
+        model_config, _ = read_mode_config(policy_ckpt_path)
+        action_cfg = model_config.get("framework", {}).get("action_model", {})
+        state_dim = int(action_cfg.get("state_dim", 0) or 0)
+        use_state = action_cfg.get("use_state", None)
+        if use_state is None:
+            return state_dim > 0
+        return bool(use_state) and state_dim > 0
 
     @staticmethod
     def get_state_stats(unnorm_key: str, policy_ckpt_path) -> dict:
